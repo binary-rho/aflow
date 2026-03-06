@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "flux",
+  "version": "0.2.0",
+  "description": "DRR 자동화 엔진 — DRR 문서를 DSL로 변환하고 브라우저에서 실행합니다.",
+  "permissions": ["debugger", "activeTab", "storage", "tabs", "tabCapture", "sidePanel"],
+  "action": {
+    "default_title": "flux"
+  },
+  "side_panel": {
+    "default_path": "index.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "icons/Icon.png",
+    "48": "icons/Icon.png",
+    "128": "icons/Icon.png"
+  }
+}

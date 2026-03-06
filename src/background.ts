@@ -1,0 +1,376 @@
+import type { Scenario } from "./app/data";
+import {
+  runScenario,
+  pauseRunner,
+  resumeRunner,
+  cancelRunner,
+} from "./engine/runner";
+import { startRecording, stopRecording, type RecordedEvent } from "./engine/recorder";
+import {
+  appendLastRunDomSnapshot,
+  clearLastRunDomSnapshots,
+} from "./stores/domCaptureStore";
+import * as cdp from "./engine/cdp";
+
+type MessageType =
+  | { type: "PING" }
+  | { type: "GET_INSPECTED_TAB_URL"; tabId: number }
+  | { type: "GET_ACTIVE_TAB_URL" }
+  | { type: "EVAL_DOM_SCRIPT"; tabId: number; script: string }
+  | { type: "RUN_SCENARIO"; scenario: Scenario; tabId: number; stepDelayMs?: number; validationOnly?: boolean; apiKey?: string }
+  | { type: "START_RECORDING"; tabId: number }
+  | { type: "STOP_RECORDING"; tabId: number }
+  | { type: "PAUSE" }
+  | { type: "RESUME" }
+  | { type: "CANCEL" };
+
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+
+const RECORDING_TAG = "직접생성";
+const RECORDED_TITLE_MAX_HOST_LENGTH = 20;
+const RECORDED_TITLE_MAX_ACTION_LENGTH = 26;
+const RECORDED_TITLE_FALLBACK = "직접 생성 시나리오";
+
+function toHost(url: string): string {
+  try {
+    return new URL(url).host || "";
+  } catch {
+    return "";
+  }
+}
+
+function toPath(url: string): string {
+  try {
+    return new URL(url).pathname || "/";
+  } catch {
+    return "/";
+  }
+}
+
+function truncateText(value: string, maxLength: number): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= maxLength) return trimmed;
+  return `${trimmed.slice(0, maxLength)}...`;
+}
+
+function buildRecordedScenarioTitle(startUrl: string, logs: RecordedEvent[]): string {
+  const titleTime = new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+  const hostLabel = truncateText(toHost(startUrl).replace(/^www\./, ""), RECORDED_TITLE_MAX_HOST_LENGTH);
+
+  const firstClick = logs.find((log) => log.type === "click" && log.text?.trim());
+  const firstInput = logs.find((log) => log.type === "input" && log.label?.trim());
+  const firstNav = logs.find((log) => log.type === "nav" && log.url?.trim());
+  const firstScroll = logs.find((log) => log.type === "scroll");
+  const firstHover = logs.find((log) => log.type === "hover" && log.text?.trim());
+  const firstSelect = logs.find((log) => log.type === "select" && log.label?.trim());
+  const firstCheck = logs.find((log) => log.type === "check" && log.label?.trim());
+  const firstKey = logs.find((log) => log.type === "keypress" && log.key?.trim());
+
+  let actionLabel = "";
+  if (firstClick && firstClick.type === "click") {
+    actionLabel = `${firstClick.text.trim()} 클릭`;
+  } else if (firstInput && firstInput.type === "input") {
+    actionLabel = `${firstInput.label.trim()} 입력`;
+  } else if (firstNav && firstNav.type === "nav") {
+    actionLabel = `${toPath(firstNav.url)} 이동`;
+  } else if (firstHover && firstHover.type === "hover") {
+    actionLabel = `${firstHover.text.trim()} 호버`;
+  } else if (firstSelect && firstSelect.type === "select") {
+    actionLabel = `${firstSelect.label.trim()} 선택`;
+  } else if (firstCheck && firstCheck.type === "check") {
+    actionLabel = `${firstCheck.label.trim()} 체크`;
+  } else if (firstKey && firstKey.type === "keypress") {
+    actionLabel = `${firstKey.key} 키 입력`;
+  } else if (firstScroll && firstScroll.type === "scroll") {
+    actionLabel = `스크롤(y:${Math.round(firstScroll.y)})`;
+  }
+
+  const safeActionLabel = truncateText(actionLabel, RECORDED_TITLE_MAX_ACTION_LENGTH);
+  if (hostLabel && safeActionLabel) return `${hostLabel} · ${safeActionLabel} ${titleTime}`;
+  if (hostLabel) return `${hostLabel} · ${RECORDED_TITLE_FALLBACK} ${titleTime}`;
+  if (safeActionLabel) return `${safeActionLabel} ${titleTime}`;
+  return `${RECORDED_TITLE_FALLBACK} ${titleTime}`;
+}
+
+function buildScenarioFromRecorded(
+  startUrl: string,
+  logs: RecordedEvent[],
+): Scenario {
+  const host = toHost(startUrl);
+  const path = toPath(startUrl);
+
+  const steps: Scenario["steps"] = [];
+  const addStep = (actionId: string, params: Record<string, any> = {}, description?: string) => {
+    const id = `s${steps.length + 1}`;
+    const prev = steps[steps.length - 1];
+    const next = { id, actionId, params, description };
+    if (prev && prev.actionId === next.actionId && JSON.stringify(prev.params || {}) === JSON.stringify(next.params || {})) {
+      return;
+    }
+    steps.push(next);
+  };
+
+  addStep("nav.goto", { url: path }, "현재 페이지로 이동합니다.");
+
+  const NAV_AFTER_CLICK_THRESHOLD_MS = 3000;
+
+  logs.forEach((log, index) => {
+    if (log.type === "nav") {
+      const navUrl = (log.url || "").trim();
+      if (!navUrl) return;
+
+      const prev = index > 0 ? logs[index - 1] : null;
+      const isNavCausedByClick =
+        prev &&
+        (prev.type === "click" || prev.type === "hover") &&
+        log.ts - prev.ts < NAV_AFTER_CLICK_THRESHOLD_MS;
+      if (isNavCausedByClick) return;
+
+      const navPath = toPath(navUrl);
+      addStep("nav.goto", { url: navPath }, `${navPath} 페이지로 이동합니다.`);
+      return;
+    }
+
+    if (log.type === "click") {
+      const clickText = (log.text || "").trim();
+      const clickSelector = (log.selector || "").trim();
+      if (!clickText && !clickSelector) return;
+
+      const params: Record<string, any> = {};
+      if (clickText) params.text = clickText;
+      if (clickSelector) params.selector = clickSelector;
+      if (log.context) params.context = log.context;
+      const clickDesc = clickText
+        ? `${clickText} 버튼을 클릭합니다.`
+        : `${clickSelector} 요소를 클릭합니다.`;
+      addStep("button.click", params, clickDesc);
+      return;
+    }
+
+    if (log.type === "scroll") {
+      const y = Number(log.y);
+      if (!Number.isFinite(y)) return;
+      const x = Number(log.x);
+      const params: Record<string, any> = { y: Math.max(0, Math.round(y)) };
+      if (Number.isFinite(x) && x > 0) params.x = Math.round(x);
+      addStep("scroll.to", params, `페이지를 아래로 스크롤합니다. (y:${params.y})`);
+      return;
+    }
+
+    if (log.type === "input") {
+      const label = (log.label || "").trim();
+      const inputSelector = (log.selector || "").trim();
+      if (!label && !inputSelector) return;
+      const params: Record<string, any> = { value: log.value };
+      if (label) params.label = label;
+      if (inputSelector) params.selector = inputSelector;
+      if (log.context) params.context = log.context;
+      const fillDesc = label
+        ? `${label} 값을 입력합니다.`
+        : `${inputSelector} 필드에 값을 입력합니다.`;
+      addStep("form.fill", params, fillDesc);
+      return;
+    }
+
+    if (log.type === "hover") {
+      const hoverText = (log.text || "").trim();
+      const hoverSelector = (log.selector || "").trim();
+      if (!hoverText && !hoverSelector) return;
+      const params: Record<string, any> = {};
+      if (hoverText) params.text = hoverText;
+      if (hoverSelector) params.selector = hoverSelector;
+      if (log.context) params.context = log.context;
+      const hoverDesc = hoverText
+        ? `${hoverText} 요소에 마우스를 올립니다.`
+        : `${hoverSelector} 요소에 마우스를 올립니다.`;
+      addStep("interaction.hover", params, hoverDesc);
+      return;
+    }
+
+    if (log.type === "select") {
+      const selectLabel = (log.label || "").trim();
+      const selectSelector = (log.selector || "").trim();
+      if (!selectLabel && !selectSelector) return;
+      const params: Record<string, any> = { value: log.value };
+      if (selectLabel) params.label = selectLabel;
+      if (log.optionText) params.optionText = log.optionText;
+      if (selectSelector) params.selector = selectSelector;
+      if (log.context) params.context = log.context;
+      const selectDesc = selectLabel
+        ? `${selectLabel}에서 ${log.optionText || log.value}을(를) 선택합니다.`
+        : `${selectSelector}에서 값을 선택합니다.`;
+      addStep("form.select", params, selectDesc);
+      return;
+    }
+
+    if (log.type === "check") {
+      const chkLabel = (log.label || "").trim();
+      const chkSelector = (log.selector || "").trim();
+      if (!chkLabel && !chkSelector) return;
+      const params: Record<string, any> = { checked: log.checked };
+      if (chkLabel) params.label = chkLabel;
+      if (chkSelector) params.selector = chkSelector;
+      if (log.context) params.context = log.context;
+      const chkDesc = chkLabel
+        ? `${chkLabel} 항목을 ${log.checked ? "체크" : "해제"}합니다.`
+        : `${chkSelector} 항목을 ${log.checked ? "체크" : "해제"}합니다.`;
+      addStep("form.check", params, chkDesc);
+      return;
+    }
+
+    if (log.type === "keypress") {
+      const key = (log.key || "").trim();
+      if (!key) return;
+      const keyLabel: Record<string, string> = { Enter: "엔터", Escape: "ESC", Tab: "탭" };
+      const params: Record<string, any> = { key };
+      if (log.selector) params.selector = log.selector;
+      addStep("keyboard.press", params, `${keyLabel[key] || key} 키를 입력합니다.`);
+    }
+  });
+
+  const recordedTitle = buildRecordedScenarioTitle(startUrl, logs);
+  return {
+    id: `sc_recorded_${Date.now()}`,
+    title: recordedTitle,
+    description: "사용자 동작 수집으로 생성된 시나리오",
+    tags: [RECORDING_TAG],
+    urlPattern: host,
+    steps,
+    createdAt: new Date().toISOString().slice(0, 10),
+  };
+}
+
+chrome.runtime.onMessage.addListener(
+  (message: MessageType, _sender, sendResponse) => {
+    switch (message.type) {
+      case "PING":
+        sendResponse({ ok: true });
+        return true;
+
+      case "GET_INSPECTED_TAB_URL": {
+        chrome.tabs.get(message.tabId, (tab) => {
+          sendResponse({ url: tab?.url ?? "" });
+        });
+        return true;
+      }
+
+      case "GET_ACTIVE_TAB_URL": {
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+          const tab = tabs?.find((t) => t.url && !t.url.startsWith("chrome"));
+          sendResponse({ url: tab?.url ?? "", tabId: tab?.id ?? null });
+        });
+        return true;
+      }
+
+      case "EVAL_DOM_SCRIPT": {
+        (async () => {
+          try {
+            await cdp.attachToTab(message.tabId);
+            const result = await cdp.evaluate(message.tabId, message.script);
+            sendResponse({ ok: true, result });
+          } catch (err: any) {
+            sendResponse({ ok: false, error: err?.message ?? String(err) });
+          } finally {
+            try { await cdp.detachFromTab(message.tabId); } catch {}
+          }
+        })();
+        return true;
+      }
+
+      case "RUN_SCENARIO": {
+        const { scenario, tabId, stepDelayMs, validationOnly, apiKey } = message;
+        function broadcastStatus(state: unknown) {
+          chrome.runtime.sendMessage({ type: "RUNNER_STATUS", state }).catch(() => {});
+        }
+        clearLastRunDomSnapshots().catch(() => {});
+        function handlePageDomCaptured(payload: { label: string; summary: string }) {
+          appendLastRunDomSnapshot(payload).catch(() => {});
+        }
+        runScenario(tabId, scenario, broadcastStatus, {
+          stepDelayMs,
+          validationOnly,
+          apiKey,
+          onPageDomCaptured: handlePageDomCaptured,
+        }).catch((err: Error) => {
+          console.error("[flux] run error:", err);
+          const msg =
+            err?.message?.includes("document is not defined")
+              ? "이 탭에서는 시나리오를 실행할 수 없습니다. 일반 웹페이지 탭에서 실행해주세요."
+              : err?.message ?? String(err);
+          broadcastStatus({
+            scenarioId: scenario.id,
+            status: "error",
+            currentStepIndex: -1,
+            totalSteps: scenario.steps.length,
+            stepResults: [],
+            error: msg,
+          });
+        });
+        sendResponse({ started: true });
+        return true;
+      }
+
+      case "START_RECORDING": {
+        startRecording(message.tabId)
+          .then(() => sendResponse({ ok: true }))
+          .catch((err: Error) => sendResponse({ ok: false, error: err?.message ?? "수집 시작 실패" }));
+        return true;
+      }
+
+      case "STOP_RECORDING": {
+        stopRecording(message.tabId)
+          .then((result) => {
+            const scenario = buildScenarioFromRecorded(result.startUrl || "", result.logs || []);
+            sendResponse({
+              ok: true,
+              scenario,
+              recordedCount: result.logs?.length ?? 0,
+            });
+          })
+          .catch((err: Error) => sendResponse({ ok: false, error: err?.message ?? "수집 종료 실패" }));
+        return true;
+      }
+
+      case "PAUSE":
+        pauseRunner();
+        sendResponse({ ok: true });
+        return true;
+
+      case "RESUME":
+        resumeRunner();
+        sendResponse({ ok: true });
+        return true;
+
+      case "CANCEL":
+        cancelRunner();
+        sendResponse({ ok: true });
+        return true;
+
+      case "GET_TAB_CAPTURE_STREAM_ID": {
+        const targetTabId = message.tabId as number;
+        (async () => {
+          try {
+            await chrome.tabs.update(targetTabId, { active: true });
+          } catch { /* ignore */ }
+
+          chrome.tabCapture.getMediaStreamId(
+            {},
+            (streamId) => {
+              if (chrome.runtime.lastError || !streamId) {
+                sendResponse({ ok: false, error: chrome.runtime.lastError?.message || "탭 캡처 ID를 가져오지 못했습니다." });
+              } else {
+                sendResponse({ ok: true, streamId });
+              }
+            },
+          );
+        })();
+        return true;
+      }
+
+      default:
+        return false;
+    }
+  },
+);
+
+console.log("[flux] background service worker loaded");
