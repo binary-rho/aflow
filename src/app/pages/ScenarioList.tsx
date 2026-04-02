@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from "react";
-import { useSearchParams } from "react-router";
+import { useSearchParams, Link } from "react-router";
 import {
   Globe,
   Search,
@@ -8,6 +8,8 @@ import {
   ChevronDown,
   Trash2,
   Loader2,
+  GitBranch,
+  MoreVertical,
 } from "lucide-react";
 import { DndProvider } from "react-dnd";
 import { HTML5Backend } from "react-dnd-html5-backend";
@@ -20,7 +22,14 @@ import { DrrInputBox } from "../components/DrrInputBox";
 import { DrrResultView } from "../components/DrrResultView";
 import { Button } from "../components/ui/button";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "../components/ui/dropdown-menu";
+import {
   getScenarios,
+  getScenarioById,
   deleteScenario,
   saveScenario,
   reorderScenarios,
@@ -33,13 +42,13 @@ import {
 } from "@/services/domSnapshot";
 import { getApiKey } from "@/stores/settingsStore";
 import { getActiveTabId } from "@/hooks/useActiveTabId";
-import {
-  cacheDomSummary,
-  getCachedPagesForDomain,
-  getCachedPageCount,
-  clearCacheForDomain,
-} from "@/stores/domCacheStore";
+import { buildScenarioRunChain } from "@/lib/scenarioChain";
+import { getSavedFlowSummary, getSavedFlows, deleteFlowFromList, type SerializedFlow } from "@/stores/flowCompositionStore";
 import { useInspectedTabUrl } from "@/hooks/useInspectedTabUrl";
+import {
+  scenarioMatchesInspectedHost,
+  resolveUrlPatternFromDsl,
+} from "@/lib/scenarioHost";
 
 type TabId = "all" | "current" | string;
 
@@ -51,19 +60,19 @@ export default function ScenarioList() {
 
   const [scenarios, setScenarios] = useState<Scenario[]>(() => getScenarios());
   const [groups, setGroups] = useState<ScenarioGroup[]>(() => getGroups());
+  const [savedFlows, setSavedFlows] = useState<SerializedFlow[]>(() => getSavedFlows());
   const [activeTab, setActiveTabState] = useState<TabId>(
     () => tabFromUrl || "current",
   );
   const [searchTerm, setSearchTerm] = useState("");
   const [showAddToGroup, setShowAddToGroup] = useState(false);
   const [isCollectingScenario, setIsCollectingScenario] = useState(false);
-  const [cacheHelpTooltip, setCacheHelpTooltip] = useState<{
-    x: number;
-    y: number;
-  } | null>(null);
-
   useEffect(() => {
-    const t = tabFromUrl || "current";
+    let t = tabFromUrl || "current";
+    if (t === "domain") {
+      t = "all";
+      setSearchParams({ [TAB_PARAM]: "all" }, { replace: true });
+    }
     setActiveTabState(t);
     if (tabFromUrl == null) {
       setSearchParams({ [TAB_PARAM]: "current" }, { replace: true });
@@ -80,7 +89,7 @@ export default function ScenarioList() {
     [setSearchParams],
   );
 
-  const { currentDomain, currentFullUrl, currentPath } = useInspectedTabUrl();
+  const { currentDomain, currentFullUrl } = useInspectedTabUrl();
 
   /** 쿼리/해시 제외, 호스트는 www 제거해 같은 페이지로 비교 (lguplus.com/mobile?p=1 === www.lguplus.com/mobile) */
   const normalizeUrlForCompare = (url: string) => {
@@ -90,47 +99,27 @@ export default function ScenarioList() {
     return withoutWww;
   };
 
-  /** 시나리오의 실제 시작 URL (base + 첫 스텝 nav.goto 경로). 현재 페이지 매칭용 */
+  /** 시나리오의 실제 시작 URL (base + 첫 스텝 nav.goto 경로). 현재 페이지 매칭용. url에는 경로만 있어야 함. */
   const getScenarioEffectiveUrl = (s: Scenario) => {
     const base = s.urlPattern.replace("flux.app", "");
     const first = s.steps[0];
     if (!first || first.actionId !== "nav.goto") return base;
-    const path = first.params?.url;
-    if (path == null || path === "") return base;
-    return `${base.replace(/\/$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
+    const raw = first.params?.url;
+    if (raw == null || raw === "") return base;
+    const urlStr = String(raw).trim().replace(/^https?:\/\//, "");
+    const slashIdx = urlStr.indexOf("/");
+    const path =
+      slashIdx >= 0 && /\./.test(urlStr.slice(0, slashIdx))
+        ? urlStr.slice(slashIdx)
+        : urlStr.startsWith("/")
+          ? urlStr
+          : `/${urlStr}`;
+    return `${base.replace(/\/$/, "")}${path}`;
   };
 
   const [drrInput, setDrrInput] = useState("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [drrResult, setDrrResult] = useState<string | null>(null);
-
-  const [cachedPageCount, setCachedPageCount] = useState(0);
-
-  useEffect(() => {
-    if (!currentDomain || currentDomain === "localhost") return;
-    getCachedPageCount(currentDomain).then(setCachedPageCount);
-  }, [currentDomain]);
-
-  useEffect(() => {
-    if (
-      !currentFullUrl ||
-      currentFullUrl === "localhost/" ||
-      !currentDomain ||
-      currentDomain === "localhost"
-    )
-      return;
-    getInspectedPageSummary().then((summary) => {
-      if (!summary) return;
-      cacheDomSummary(currentDomain, currentPath, summary).then(() => {
-        getCachedPageCount(currentDomain).then(setCachedPageCount);
-      });
-    });
-  }, [currentFullUrl, currentDomain, currentPath]);
-
-  const handleClearCache = async () => {
-    await clearCacheForDomain(currentDomain);
-    setCachedPageCount(0);
-  };
 
   /** 카드에서 '검증' 클릭 시 실행 페이지로 가지 않고 여기서 결과만 토스트로 표시 */
   const [validationToast, setValidationToast] = useState<{
@@ -154,7 +143,9 @@ export default function ScenarioList() {
   const handleRunValidation = useCallback(async (scenario: Scenario) => {
     const tabId = await getActiveTabId();
     if (!tabId) {
-      alert("활성 탭을 찾을 수 없습니다. 대상 페이지 탭을 선택한 뒤 다시 시도하세요.");
+      alert(
+        "활성 탭을 찾을 수 없습니다. 대상 페이지 탭을 선택한 뒤 다시 시도하세요.",
+      );
       return;
     }
     pendingValidationIdRef.current = scenario.id;
@@ -167,9 +158,11 @@ export default function ScenarioList() {
       currentStepLabel: "",
     });
     try {
+      const chain = buildScenarioRunChain(scenario, getScenarioById);
       await chrome.runtime.sendMessage({
         type: "RUN_SCENARIO",
         scenario,
+        scenarios: chain.length > 1 ? chain : undefined,
         tabId,
         stepDelayMs: 800,
         validationOnly: true,
@@ -266,8 +259,9 @@ export default function ScenarioList() {
     setGroups(getGroups());
   }, []);
 
+  /** 현재 검사 탭 호스트와 urlPattern이 맞는 시나리오 (「전체」 탭 목록) */
   const domainScenarios = scenarios.filter((s) =>
-    s.urlPattern.includes(currentDomain),
+    scenarioMatchesInspectedHost(s.urlPattern, currentDomain),
   );
 
   const getFirstDepth = (fullUrl: string) => {
@@ -291,7 +285,7 @@ export default function ScenarioList() {
   const listByTab: Scenario[] = (() => {
     if (activeTab === "all") return domainScenarios;
     if (activeTab === "current") return currentPageScenarios;
-    return domainScenarios.filter(
+    return scenarios.filter(
       (s) =>
         s.groupIds?.includes(activeTab) || (s as any).groupId === activeTab,
     );
@@ -306,6 +300,23 @@ export default function ScenarioList() {
           ),
       )
     : listByTab;
+
+  const savedFlowSummary = getSavedFlowSummary();
+
+  const refreshFlows = useCallback(() => {
+    setSavedFlows(getSavedFlows());
+  }, []);
+
+  const handleDeleteFlow = useCallback((flowId: string) => {
+    deleteFlowFromList(flowId);
+    refreshFlows();
+  }, [refreshFlows]);
+
+  const filteredFlows = searchTerm
+    ? savedFlows.filter((f) =>
+        f.name.toLowerCase().includes(searchTerm.toLowerCase()),
+      )
+    : savedFlows;
 
   const handleDeleteScenario = (id: string) => {
     deleteScenario(id);
@@ -390,16 +401,10 @@ export default function ScenarioList() {
         alert("설정에서 OpenAI API 키를 먼저 입력해주세요.");
         return;
       }
-      const cached = await getCachedPagesForDomain(currentDomain);
-      const pageSummary =
-        cached.length > 0
-          ? cached
-              .map((entry, i) => {
-                const label = entry.path === "/" ? "홈" : entry.path;
-                return `## Page ${i + 1}: ${label}\n${formatPageSummaryForLLM(entry.summary)}`;
-              })
-              .join("\n\n")
-          : null;
+      const currentPageSummary = await getInspectedPageSummary();
+      const pageSummary = currentPageSummary
+        ? `## 현재 페이지\n${formatPageSummaryForLLM(currentPageSummary)}`
+        : null;
       const dsl = await generateDSL(drrInput, apiKey, {
         pageSummary,
         currentHost: currentDomain || undefined,
@@ -417,10 +422,18 @@ export default function ScenarioList() {
     try {
       const dsl = JSON.parse(drrResult);
       const rawBase = (dsl.baseUrl || "").trim();
-      const baseUrl = rawBase
-        ? rawBase.replace(/^https?:\/\//, "").split("/")[0] || currentDomain
-        : currentDomain;
       const allSteps = [...(dsl.steps || []), ...(dsl.assertions || [])];
+      const firstNav = allSteps.find(
+        (x: { action?: string }) => x.action === "nav.goto",
+      ) as { params?: Record<string, unknown> } | undefined;
+      const firstNavRaw =
+        firstNav?.params?.url != null ? String(firstNav.params.url) : "";
+      const urlPattern = resolveUrlPatternFromDsl(
+        rawBase,
+        currentDomain,
+        firstNavRaw || undefined,
+      );
+      /** nav.goto의 url에는 경로만 저장 (도메인은 urlPattern에만). */
       const steps = allSteps.map(
         (
           s: {
@@ -431,16 +444,24 @@ export default function ScenarioList() {
           i: number,
         ) => {
           const params = { ...s.params };
-          if (
-            s.action === "nav.goto" &&
-            params.path != null &&
-            params.url == null
-          ) {
-            params.url =
-              baseUrl +
-              (String(params.path).startsWith("/") ? "" : "/") +
-              String(params.path);
+          if (s.action === "nav.goto") {
+            let rawPath =
+              params.path != null
+                ? String(params.path).trim()
+                : (params.url as string)?.trim() ?? "";
             delete params.path;
+            if (rawPath) {
+              rawPath = rawPath.replace(/^https?:\/\//, "");
+              const slashIdx = rawPath.indexOf("/");
+              const looksLikeHostPath =
+                slashIdx >= 0 && /\./.test(rawPath.slice(0, slashIdx));
+              const pathOnly = looksLikeHostPath
+                ? rawPath.slice(slashIdx)
+                : rawPath.startsWith("/")
+                  ? rawPath
+                  : `/${rawPath}`;
+              params.url = pathOnly;
+            }
           }
           return {
             id: `s${i + 1}`,
@@ -450,12 +471,14 @@ export default function ScenarioList() {
           };
         },
       );
+      const clarification =
+        typeof dsl.drrClarification === "string" ? dsl.drrClarification.trim() : "";
       const scenario: Scenario = {
         id: `sc_${Date.now()}`,
         title: dsl.name || dsl.title || "새 시나리오",
-        description: "",
+        description: clarification || (dsl.description as string) || "",
         tags: [],
-        urlPattern: currentDomain,
+        urlPattern,
         steps,
         createdAt: new Date().toISOString().slice(0, 10),
       };
@@ -515,18 +538,6 @@ export default function ScenarioList() {
 
   return (
     <Layout>
-      {cacheHelpTooltip && (
-        <div
-          className="fixed z-[70] pointer-events-none w-[294px] max-w-[80vw] p-2 rounded-md border border-[var(--flux-border)] bg-white text-[10px] text-[var(--flux-text-muted)] shadow-md leading-relaxed"
-          style={{
-            left: cacheHelpTooltip.x,
-            top: cacheHelpTooltip.y,
-          }}
-        >
-          페이지를 이동할 때마다 DOM이 자동으로 학습됩니다. <br />
-          변환 시 이 사이트에서 방문한 모든 페이지 정보가 LLM에 전달됩니다.
-        </div>
-      )}
       {validationProgress && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2.5 rounded-lg shadow-lg border text-sm animate-in fade-in zoom-in-95 duration-200 bg-white max-w-[92vw] w-max">
           <Loader2 className="w-4 h-4 animate-spin text-[var(--flux-primary)]" />
@@ -585,8 +596,8 @@ export default function ScenarioList() {
         </div>
       )}
       <DndProvider backend={HTML5Backend}>
-        <div className="flex flex-col min-h-0 flex-1 w-full max-w-full overflow-hidden pb-safe">
-          <div className="bg-white/95 backdrop-blur-md border-b border-[var(--flux-border-light)] px-3 py-2.5 flex items-center gap-2 text-xs text-[var(--flux-text-muted)] sticky top-0 z-30 transition-all mb-1 shadow-sm min-w-0">
+        <div className="flex flex-col min-h-0 flex-1 w-full max-w-full h-full pb-safe px-0">
+          <div className="bg-white/95 backdrop-blur-md border-b border-[var(--flux-border-light)] px-3 py-2.5 flex items-center gap-2 text-xs text-[var(--flux-text-muted)] shrink-0 z-30 transition-all mb-1 shadow-sm min-w-0">
             <Globe className="w-3.5 h-3.5 text-[var(--flux-primary)] shrink-0" />
             <span
               className="text-[var(--flux-text-default)] font-mono text-xs font-medium truncate min-w-0"
@@ -601,11 +612,10 @@ export default function ScenarioList() {
             icon={Plus}
             defaultOpen={true}
             headerAction={
-              <Button
-                variant="outline"
-                size="sm"
+              <button
+                type="button"
                 onClick={handleManualCreate}
-                className={`text-[11px] font-bold rounded flex items-center gap-1 active:scale-95 ${
+                className={`inline-flex items-center gap-1 text-[11px] font-bold rounded active:scale-95 transition-colors px-2 py-1 border ${
                   isCollectingScenario
                     ? "text-red-600 bg-red-50 border-red-200 hover:bg-red-100 hover:border-red-300"
                     : "text-[var(--flux-text-muted)] hover:text-[var(--flux-primary)] bg-[var(--flux-bg-subtle)] hover:bg-[var(--flux-primary-muted)] border-[var(--flux-border)] hover:border-pink-200"
@@ -616,42 +626,13 @@ export default function ScenarioList() {
                     : "직접 생성 시작"
                 }
               >
-                {isCollectingScenario ? "수집 정지" : "직접 생성"}
-              </Button>
+                {isCollectingScenario ? "기록 중..." : "직접 생성"}
+              </button>
             }
           >
             <div className="flex flex-col gap-0">
               {!drrResult ? (
                 <>
-                  <div className="flex items-center gap-2 ml-1.5 mb-1.5">
-                    <span className="text-[11px] text-[var(--flux-text-muted)] font-medium">
-                      학습된 페이지 {cachedPageCount}개
-                    </span>
-                    {cachedPageCount > 0 && (
-                      <button
-                        type="button"
-                        onClick={handleClearCache}
-                        className="text-[10px] text-[var(--flux-text-muted)] hover:text-red-500 underline"
-                      >
-                        초기화
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="w-3 h-3 rounded-full bg-[var(--flux-text-muted)] text-white text-[8px] leading-none font-bold flex items-center justify-center"
-                      aria-label="학습 안내"
-                      onMouseEnter={(e) => {
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        setCacheHelpTooltip({
-                          x: rect.right + 6,
-                          y: rect.top,
-                        });
-                      }}
-                      onMouseLeave={() => setCacheHelpTooltip(null)}
-                    >
-                      i
-                    </button>
-                  </div>
                   <DrrInputBox
                     value={drrInput}
                     onChange={setDrrInput}
@@ -674,12 +655,22 @@ export default function ScenarioList() {
             icon={Globe}
             count={listByTab.length}
             defaultOpen={true}
+            fillRemaining
+            headerAction={
+              <Link
+                to="/flow"
+                className="inline-flex items-center gap-1 text-[11px] font-bold rounded active:scale-95 text-[var(--flux-text-muted)] hover:text-[var(--flux-primary)] bg-[var(--flux-bg-subtle)] hover:bg-[var(--flux-primary-muted)] border border-[var(--flux-border)] hover:border-pink-200 transition-colors px-2 py-1"
+              >
+                시나리오 조합
+              </Link>
+            }
           >
             <div className="space-y-3">
               <div className="flex flex-wrap items-center gap-1.5">
                 <button
                   type="button"
                   onClick={() => setActiveTab("all")}
+                  title={`검사 중 탭과 urlPattern이 맞는 시나리오 (${currentDomain || "…"})`}
                   className={`px-2.5 py-1 rounded-md text-[11px] font-bold transition-colors border ${
                     activeTab === "all"
                       ? "bg-[var(--flux-primary)] text-white border-[var(--flux-primary)]"
@@ -698,6 +689,17 @@ export default function ScenarioList() {
                   }`}
                 >
                   현재 페이지
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("flows")}
+                  className={`px-2.5 py-1 rounded-md text-[11px] font-bold transition-colors border ${
+                    activeTab === "flows"
+                      ? "bg-[var(--flux-primary)] text-white border-[var(--flux-primary)]"
+                      : "bg-white text-[var(--flux-text-muted)] border-[var(--flux-border)] hover:border-[var(--flux-primary)] hover:text-[var(--flux-primary)]"
+                  }`}
+                >
+                  플로우
                 </button>
                 {groups.map((g) => (
                   <div
@@ -742,14 +744,14 @@ export default function ScenarioList() {
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[var(--flux-text-muted)] group-focus-within:text-[var(--flux-primary)] transition-colors" />
                 <input
                   type="text"
-                  placeholder="제목, 태그 검색..."
+                  placeholder={activeTab === "flows" ? "플로우 이름 검색..." : "제목, 태그 검색..."}
                   className="w-full pl-9 pr-3 py-2 bg-[var(--flux-bg-subtle)] border border-[var(--flux-border)] focus:bg-white focus:border-[var(--flux-primary)] focus:ring-2 focus:ring-[var(--flux-ring)] rounded-lg text-xs transition-all outline-none placeholder:text-[var(--flux-text-muted)]"
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                 />
               </div>
 
-              {activeGroup && (
+              {activeGroup && activeTab !== "flows" && (
                 <div className="relative">
                   <button
                     type="button"
@@ -794,68 +796,149 @@ export default function ScenarioList() {
                 </div>
               )}
 
-              <div className="space-y-2">
-                {filteredList.length > 0 ? (
-                  filteredList.map((scenario) =>
-                    searchTerm ? (
-                      <ScenarioCard
-                        key={scenario.id}
-                        scenario={scenario}
-                        onDelete={handleDeleteScenario}
-                        onRemoveFromGroup={handleRemoveScenarioFromGroup}
-                        onRunValidation={handleRunValidation}
-                        groups={groups}
-                        activeGroupId={
-                          activeTab !== "all" && activeTab !== "current"
-                            ? activeTab
-                            : null
-                        }
-                        linkState={{ fromTab: activeTab }}
-                        validationProgress={
-                          validationProgress?.scenarioId === scenario.id
-                            ? validationProgress
-                            : null
-                        }
-                      />
-                    ) : (
-                      <DraggableScenarioCard
-                        key={scenario.id}
-                        scenario={scenario}
-                        index={scenarios.indexOf(scenario)}
-                        onDelete={handleDeleteScenario}
-                        onMove={handleMoveScenario}
-                        onRemoveFromGroup={handleRemoveScenarioFromGroup}
-                        onRunValidation={handleRunValidation}
-                        groups={groups}
-                        activeGroupId={
-                          activeTab !== "all" && activeTab !== "current"
-                            ? activeTab
-                            : null
-                        }
-                        linkState={{ fromTab: activeTab }}
-                        validationProgress={
-                          validationProgress?.scenarioId === scenario.id
-                            ? validationProgress
-                            : null
-                        }
-                      />
-                    ),
-                  )
-                ) : (
-                  <div className="text-center py-8 text-[var(--flux-text-muted)] text-xs flex flex-col items-center gap-1.5 opacity-60">
-                    <Search className="w-5 h-5 mb-0.5 opacity-50" />
-                    <span className="whitespace-pre-line">
-                      {searchTerm
-                        ? "검색 결과가 없습니다."
-                        : activeTab === "current"
-                          ? "이 페이지에 저장된 시나리오가 없습니다."
-                          : activeGroup
-                            ? `"${activeGroup.name}" 그룹에 시나리오가 없습니다.\n위에서 시나리오 추가로 넣어보세요.`
-                            : "시나리오가 없습니다."}
-                    </span>
-                  </div>
-                )}
-              </div>
+              {activeTab === "flows" ? (
+                <div className="space-y-2">
+                  {filteredFlows.length > 0 ? (
+                    filteredFlows.map((flow) => (
+                      <Link
+                        key={flow.id}
+                        to={`/flow/${flow.id}`}
+                        className="block relative bg-white rounded-lg border border-[var(--flux-border-light)] hover:border-[var(--flux-primary)] transition-all p-3 shadow-[0_2px_8px_-4px_rgba(0,0,0,0.05)] hover:shadow-md group"
+                      >
+                        <div className="absolute right-2 top-2 z-10">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <button
+                                type="button"
+                                onClick={(e) => e.preventDefault()}
+                                onPointerDown={(e) => e.stopPropagation()}
+                                className="w-7 h-7 flex items-center justify-center rounded text-[var(--flux-text-muted)] hover:text-[var(--flux-primary)] hover:bg-[var(--flux-primary-muted)] transition-colors"
+                                title="메뉴"
+                                aria-label="메뉴"
+                              >
+                                <MoreVertical className="w-3.5 h-3.5 stroke-[2.5]" />
+                              </button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()} className="text-xs min-w-[8rem]">
+                              <DropdownMenuItem
+                                variant="destructive"
+                                className="text-xs py-1.5"
+                                onSelect={(e) => {
+                                  e.preventDefault();
+                                  if (!confirm(`"${flow.name}" 플로우를 삭제할까요?`)) return;
+                                  handleDeleteFlow(flow.id!);
+                                }}
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                플로우 삭제
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
+
+                        <h3
+                          className="font-semibold text-[var(--flux-text-default)] text-sm leading-snug truncate pr-10"
+                          title={flow.name}
+                        >
+                          {flow.name}
+                        </h3>
+
+                        <div className="flex items-center gap-1.5 min-w-0 text-[11px] text-[var(--flux-text-muted)] font-mono mt-1 mb-2 group-hover:text-gray-600 transition-colors">
+                          <Globe className="w-3 h-3 shrink-0" />
+                          <span className="truncate min-w-0">
+                            노드 {flow.nodes.length}개 · 연결 {flow.edges.length}개
+                          </span>
+                        </div>
+
+                        <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-[var(--flux-border-light)]">
+                          <span className="text-[10px] text-[var(--flux-text-muted)] bg-[var(--flux-bg-subtle)] px-1.5 py-0.5 rounded border border-[var(--flux-border-light)] group-hover:bg-[var(--flux-primary-muted)] group-hover:text-[var(--flux-primary)] transition-colors">
+                            플로우
+                          </span>
+                          {flow.createdAt && (
+                            <span className="text-[10px] text-[var(--flux-text-muted)] bg-[var(--flux-bg-subtle)] px-1.5 py-0.5 rounded border border-[var(--flux-border-light)]">
+                              {flow.createdAt}
+                            </span>
+                          )}
+                        </div>
+                      </Link>
+                    ))
+                  ) : (
+                    <div className="text-center py-8 text-[var(--flux-text-muted)] text-xs flex flex-col items-center gap-1.5 opacity-60">
+                      <Search className="w-5 h-5 mb-0.5 opacity-50" />
+                      <span className="whitespace-pre-line">
+                        {searchTerm
+                          ? "검색 결과가 없습니다."
+                          : "저장된 플로우가 없습니다.\n우측 상단 '플로우 만들기'를 눌러 시나리오를 조합해보세요."}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {filteredList.length > 0 ? (
+                    filteredList.map((scenario) =>
+                      searchTerm ? (
+                        <ScenarioCard
+                          key={scenario.id}
+                          scenario={scenario}
+                          onDelete={handleDeleteScenario}
+                          onRemoveFromGroup={handleRemoveScenarioFromGroup}
+                          onRunValidation={handleRunValidation}
+                          groups={groups}
+                          activeGroupId={
+                            activeTab !== "all" && activeTab !== "current"
+                              ? activeTab
+                              : null
+                          }
+                          linkState={{ fromTab: activeTab }}
+                          validationProgress={
+                            validationProgress?.scenarioId === scenario.id
+                              ? validationProgress
+                              : null
+                          }
+                        />
+                      ) : (
+                        <DraggableScenarioCard
+                          key={scenario.id}
+                          scenario={scenario}
+                          index={scenarios.indexOf(scenario)}
+                          onDelete={handleDeleteScenario}
+                          onMove={handleMoveScenario}
+                          onRemoveFromGroup={handleRemoveScenarioFromGroup}
+                          onRunValidation={handleRunValidation}
+                          groups={groups}
+                          activeGroupId={
+                            activeTab !== "all" && activeTab !== "current"
+                              ? activeTab
+                              : null
+                          }
+                          linkState={{ fromTab: activeTab }}
+                          validationProgress={
+                            validationProgress?.scenarioId === scenario.id
+                              ? validationProgress
+                              : null
+                          }
+                        />
+                      ),
+                    )
+                  ) : (
+                    <div className="text-center py-8 text-[var(--flux-text-muted)] text-xs flex flex-col items-center gap-1.5 opacity-60">
+                      <Search className="w-5 h-5 mb-0.5 opacity-50" />
+                      <span className="whitespace-pre-line">
+                        {searchTerm
+                          ? "검색 결과가 없습니다."
+                          : activeTab === "current"
+                            ? "이 페이지에 저장된 시나리오가 없습니다."
+                            : activeTab === "all"
+                              ? "현재 도메인에 저장된 시나리오가 없습니다."
+                              : activeGroup
+                                ? `"${activeGroup.name}" 그룹에 시나리오가 없습니다.\n위에서 시나리오 추가로 넣어보세요.`
+                                : "시나리오가 없습니다."}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </Section>
 

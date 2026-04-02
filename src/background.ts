@@ -1,6 +1,7 @@
 import type { Scenario } from "./app/data";
 import {
   runScenario,
+  runScenarioChain,
   pauseRunner,
   resumeRunner,
   cancelRunner,
@@ -17,12 +18,24 @@ type MessageType =
   | { type: "GET_INSPECTED_TAB_URL"; tabId: number }
   | { type: "GET_ACTIVE_TAB_URL" }
   | { type: "EVAL_DOM_SCRIPT"; tabId: number; script: string }
-  | { type: "RUN_SCENARIO"; scenario: Scenario; tabId: number; stepDelayMs?: number; validationOnly?: boolean; apiKey?: string }
+  | {
+      type: "RUN_SCENARIO";
+      scenario: Scenario;
+      /** 있으면 체인 실행(2번째부터 첫 nav.goto 생략). 없으면 scenario 단일 실행 */
+      scenarios?: Scenario[];
+      tabId: number;
+      stepDelayMs?: number;
+      validationOnly?: boolean;
+      apiKey?: string;
+      llmProvider?: string;
+      startFromIndex?: number;
+    }
   | { type: "START_RECORDING"; tabId: number }
   | { type: "STOP_RECORDING"; tabId: number }
   | { type: "PAUSE" }
   | { type: "RESUME" }
-  | { type: "CANCEL" };
+  | { type: "CANCEL" }
+  | { type: "GET_TAB_CAPTURE_STREAM_ID"; tabId: number };
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
@@ -78,7 +91,7 @@ function buildRecordedScenarioTitle(startUrl: string, logs: RecordedEvent[]): st
   } else if (firstSelect && firstSelect.type === "select") {
     actionLabel = `${firstSelect.label.trim()} 선택`;
   } else if (firstCheck && firstCheck.type === "check") {
-    actionLabel = `${firstCheck.label.trim()} 체크`;
+    actionLabel = `${firstCheck.label.trim()} 클릭`;
   } else if (firstKey && firstKey.type === "keypress") {
     actionLabel = `${firstKey.key} 키 입력`;
   } else if (firstScroll && firstScroll.type === "scroll") {
@@ -90,6 +103,24 @@ function buildRecordedScenarioTitle(startUrl: string, logs: RecordedEvent[]): st
   if (hostLabel) return `${hostLabel} · ${RECORDED_TITLE_FALLBACK} ${titleTime}`;
   if (safeActionLabel) return `${safeActionLabel} ${titleTime}`;
   return `${RECORDED_TITLE_FALLBACK} ${titleTime}`;
+}
+
+function mergeConsecutiveScrolls(logs: RecordedEvent[]): RecordedEvent[] {
+  const result: RecordedEvent[] = [];
+  let lastScroll: RecordedEvent | null = null;
+  for (const log of logs) {
+    if (log.type === "scroll") {
+      lastScroll = log;
+      continue;
+    }
+    if (lastScroll) {
+      result.push(lastScroll);
+      lastScroll = null;
+    }
+    result.push(log);
+  }
+  if (lastScroll) result.push(lastScroll);
+  return result;
 }
 
 function buildScenarioFromRecorded(
@@ -114,12 +145,14 @@ function buildScenarioFromRecorded(
 
   const NAV_AFTER_CLICK_THRESHOLD_MS = 3000;
 
-  logs.forEach((log, index) => {
+  const mergedLogs = mergeConsecutiveScrolls(logs);
+
+  mergedLogs.forEach((log, index) => {
     if (log.type === "nav") {
       const navUrl = (log.url || "").trim();
       if (!navUrl) return;
 
-      const prev = index > 0 ? logs[index - 1] : null;
+      const prev = index > 0 ? mergedLogs[index - 1] : null;
       const isNavCausedByClick =
         prev &&
         (prev.type === "click" || prev.type === "hover") &&
@@ -207,13 +240,28 @@ function buildScenarioFromRecorded(
       const chkLabel = (log.label || "").trim();
       const chkSelector = (log.selector || "").trim();
       if (!chkLabel && !chkSelector) return;
-      const params: Record<string, any> = { checked: log.checked };
+      const params: Record<string, any> = {};
+      if (log.clickOnly === true) {
+        params.clickOnly = true;
+      } else if (typeof log.checked === "boolean") {
+        params.checked = log.checked;
+      } else {
+        params.clickOnly = true;
+      }
       if (chkLabel) params.label = chkLabel;
       if (chkSelector) params.selector = chkSelector;
       if (log.context) params.context = log.context;
-      const chkDesc = chkLabel
-        ? `${chkLabel} 항목을 ${log.checked ? "체크" : "해제"}합니다.`
-        : `${chkSelector} 항목을 ${log.checked ? "체크" : "해제"}합니다.`;
+      const chkDesc = (() => {
+        if (params.clickOnly) {
+          return chkLabel
+            ? `${chkLabel} 항목을 클릭합니다.`
+            : `${chkSelector} 항목을 클릭합니다.`;
+        }
+        const on = log.checked === true;
+        return chkLabel
+          ? `${chkLabel} 항목을 ${on ? "체크" : "해제"}합니다.`
+          : `${chkSelector} 항목을 ${on ? "체크" : "해제"}합니다.`;
+      })();
       addStep("form.check", params, chkDesc);
       return;
     }
@@ -264,6 +312,7 @@ chrome.runtime.onMessage.addListener(
 
       case "EVAL_DOM_SCRIPT": {
         (async () => {
+          const wasAlreadyAttached = cdp.isAttached(message.tabId);
           try {
             await cdp.attachToTab(message.tabId);
             const result = await cdp.evaluate(message.tabId, message.script);
@@ -271,14 +320,19 @@ chrome.runtime.onMessage.addListener(
           } catch (err: any) {
             sendResponse({ ok: false, error: err?.message ?? String(err) });
           } finally {
-            try { await cdp.detachFromTab(message.tabId); } catch {}
+            if (!wasAlreadyAttached) {
+              try { await cdp.detachFromTab(message.tabId); } catch {}
+            }
           }
         })();
         return true;
       }
 
       case "RUN_SCENARIO": {
-        const { scenario, tabId, stepDelayMs, validationOnly, apiKey } = message;
+        const { scenario, scenarios, tabId, stepDelayMs, validationOnly, apiKey, llmProvider, startFromIndex } =
+          message;
+        const chain =
+          scenarios && scenarios.length > 0 ? scenarios : [scenario];
         function broadcastStatus(state: unknown) {
           chrome.runtime.sendMessage({ type: "RUNNER_STATUS", state }).catch(() => {});
         }
@@ -286,12 +340,19 @@ chrome.runtime.onMessage.addListener(
         function handlePageDomCaptured(payload: { label: string; summary: string }) {
           appendLastRunDomSnapshot(payload).catch(() => {});
         }
-        runScenario(tabId, scenario, broadcastStatus, {
+        const opts = {
           stepDelayMs,
           validationOnly,
           apiKey,
+          llmProvider,
+          startFromIndex,
           onPageDomCaptured: handlePageDomCaptured,
-        }).catch((err: Error) => {
+        };
+        const runPromise =
+          chain.length > 1
+            ? runScenarioChain(tabId, chain, broadcastStatus as (s: import("./engine/runner").RunnerState) => void, opts)
+            : runScenario(tabId, chain[0], broadcastStatus as (s: import("./engine/runner").RunnerState) => void, opts);
+        runPromise.catch((err: Error) => {
           console.error("[flux] run error:", err);
           const msg =
             err?.message?.includes("document is not defined")

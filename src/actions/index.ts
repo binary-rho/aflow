@@ -1,4 +1,4 @@
-import { gotoAction, waitAction, scrollToAction } from "./navigation";
+import { gotoAction, waitAction, scrollToAction, scrollByAction } from "./navigation";
 import { loginAction, signupAction } from "./auth";
 import { clickButtonAction, fillFormAction, gnbClickLoginAction, hoverAction, selectOptionAction, checkAction, keypressAction } from "./interaction";
 import {
@@ -10,13 +10,14 @@ import {
 export type ActionFn = (
   tabId: number,
   params?: Record<string, any>,
-  options?: { validationOnly?: boolean; apiKey?: string },
+  options?: { validationOnly?: boolean; apiKey?: string; llmProvider?: string },
 ) => Promise<void>;
 
 const registry: Record<string, ActionFn> = {
   "nav.goto": gotoAction,
   "nav.wait": waitAction,
   "scroll.to": scrollToAction,
+  "scroll.by": scrollByAction,
   "auth.login": loginAction,
   "auth.signup": signupAction,
   "button.click": clickButtonAction,

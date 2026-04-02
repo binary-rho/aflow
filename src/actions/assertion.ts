@@ -32,15 +32,19 @@ export const assertHiddenAction: ActionFn = async (tabId, params, _options) => {
 };
 
 export const assertTextAction: ActionFn = async (tabId, params, _options) => {
-  const { selector, text } = params ?? {};
-  if (!selector || !text) throw new Error("assert.text requires 'selector' and 'text' params");
+  const { selector, text, expected, expectedText } = params ?? {};
+  const target = text ?? expected ?? expectedText;
+  if (!selector || target == null || target === "")
+    throw new Error("assert.text requires 'selector' and 'text' (or 'expected' / 'expectedText') params");
 
   const actual = await cdp.evaluate(
     tabId,
     `document.querySelector(${JSON.stringify(selector)})?.textContent?.trim() ?? ""`,
   );
 
-  if (!actual.includes(text)) {
-    throw new Error(`Assertion failed: expected text "${text}" in "${selector}", got "${actual}"`);
+  if (!actual.includes(target)) {
+    throw new Error(
+      `Assertion failed: expected text "${target}" in "${selector}", got "${actual}"`,
+    );
   }
 };

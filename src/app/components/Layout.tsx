@@ -60,7 +60,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         </div>
       </header>
 
-      <main className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden scrollbar-hide relative bg-white">
+      <main className="flex-1 min-h-0 overflow-hidden relative bg-white flex flex-col">
         {children}
       </main>
 

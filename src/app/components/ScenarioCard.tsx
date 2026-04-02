@@ -35,18 +35,29 @@ export function ScenarioCard({
   linkState,
   validationProgress = null,
 }: ScenarioCardProps) {
-  const basePath = scenario.urlPattern.replace("flux.app", "");
+  const hostForHint = scenario.urlPattern.replace("flux.app", "");
+  /** 첫 스텝 nav.goto: 경로만 저장하는 모델 → 카드에는 경로만 표시(호스트는 urlPattern에만). */
   const startingPath = (() => {
     const first = scenario.steps[0];
     if (!first || first.actionId !== "nav.goto") return null;
     const url = first.params?.url;
     if (url == null || url === "") return null;
-    return url;
+    const s = String(url).trim().replace(/^https?:\/\//, "");
+    const slashIdx = s.indexOf("/");
+    const pathOnly =
+      slashIdx >= 0 && /\./.test(s.slice(0, slashIdx)) ? s.slice(slashIdx) : s.startsWith("/") ? s : `/${s}`;
+    return pathOnly;
   })();
-  const displayUrl =
-    startingPath != null && startingPath !== ""
-      ? `${basePath.replace(/\/$/, "")}${startingPath.startsWith("/") ? startingPath : `/${startingPath}`}`
-      : basePath;
+  const pathStr = startingPath != null ? String(startingPath).trim() : "";
+  const hasPathStart = pathStr.length > 0;
+  const displayUrl = hasPathStart
+    ? pathStr.startsWith("/")
+      ? pathStr
+      : `/${pathStr}`
+    : hostForHint;
+  const displayTitle = hasPathStart
+    ? `${hostForHint.replace(/\/$/, "")}${displayUrl}`
+    : displayUrl;
 
   const raw =
     Array.isArray(scenario.groupIds)
@@ -164,11 +175,16 @@ export function ScenarioCard({
         title={scenario.title}
       >
         {scenario.title}
+        {scenario.followUpScenarioId ? (
+          <span className="ml-1.5 text-[9px] font-semibold text-violet-600 align-middle">
+            후속
+          </span>
+        ) : null}
       </h3>
 
       <div className="flex items-center gap-1.5 min-w-0 text-[11px] text-[var(--flux-text-muted)] font-mono mt-1 mb-2 group-hover:text-gray-600 transition-colors">
         <Globe className="w-3 h-3 shrink-0" />
-        <span className="truncate min-w-0" title={displayUrl}>
+        <span className="truncate min-w-0" title={displayTitle}>
           {displayUrl}
         </span>
       </div>

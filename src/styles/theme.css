@@ -194,3 +194,14 @@
     line-height: 1.5;
   }
 }
+
+/** 스크롤은 되지만 스크롤바는 보이지 않게 (width: 0 / display: none) */
+.scrollbar-hide {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}

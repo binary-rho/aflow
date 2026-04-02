@@ -11,21 +11,25 @@ import {
   Code2,
   Video,
   Square,
+  SkipForward,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { ACTION_REGISTRY } from "../data";
 import { Layout } from "../components/Layout";
-import { getScenarioById, saveScenario } from "@/stores/scenarioStore";
+import { getScenarioById, getScenarios, saveScenario } from "@/stores/scenarioStore";
+import { buildScenarioRunChain } from "@/lib/scenarioChain";
 import {
   getStepDelayPreset,
   setStepDelayPreset,
   getStepDelayMs,
   getApiKey,
+  getLlmProvider,
   STEP_DELAY_PRESETS,
   type StepDelayPreset,
 } from "@/stores/settingsStore";
 import { isActionImplemented } from "@/actions";
 import type { RunnerState } from "@/engine/runner";
+import type { Scenario as ScenarioType } from "../data";
 import { useInspectedTabUrl } from "@/hooks/useInspectedTabUrl";
 import { getActiveTabId } from "@/hooks/useActiveTabId";
 import { useRunButton } from "@/app/contexts/RunButtonContext";
@@ -91,8 +95,13 @@ export default function ScenarioRunner() {
     getStepDelayPreset(),
   );
   const [validationOnly, setValidationOnly] = useState(false);
+  const [displayScenario, setDisplayScenario] = useState(() =>
+    id ? getScenarioById(id) : undefined,
+  );
+  const [chainMeta, setChainMeta] = useState<{ part: number; total: number } | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const cancelledRef = useRef(false);
+  const runChainRef = useRef<ScenarioType[]>([]);
   const { currentFullUrl } = useInspectedTabUrl();
   const stepRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const { registerRun } = useRunButton();
@@ -103,7 +112,13 @@ export default function ScenarioRunner() {
     if (fromUrl === "1" || fromUrl === "true") setValidationOnly(true);
   }, [searchParams]);
 
-  const handleStartRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    if (!scenario) return;
+    setDisplayScenario(scenario);
+    setChainMeta(null);
+  }, [scenario?.id]);
+
+  const handleStartRef = useRef<(startFromIndex?: number) => void>(() => {});
   const didAutoStartValidation = useRef(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -225,6 +240,14 @@ export default function ScenarioRunner() {
       if (!scenario) return;
       if (cancelledRef.current) return;
 
+      const chain = runChainRef.current;
+      const active =
+        chain.find((s) => s.id === state.scenarioId) ?? scenario;
+      setDisplayScenario(active);
+      if (state.chainPart != null && state.chainTotal != null) {
+        setChainMeta({ part: state.chainPart, total: state.chainTotal });
+      }
+
       setCurrentStepIndex(state.currentStepIndex);
       setLastError(state.error ?? null);
 
@@ -236,7 +259,7 @@ export default function ScenarioRunner() {
 
       const newStatuses: Record<string, StepStatus> = {};
       const newStepErrors: Record<string, string> = {};
-      scenario.steps.forEach((step, i) => {
+      active.steps.forEach((step, i) => {
         const result = state.stepResults[i];
         if (result) {
           newStatuses[step.id] =
@@ -288,12 +311,18 @@ export default function ScenarioRunner() {
     }
   };
 
-  const handleStart = async () => {
+  const handleStart = async (startFromIndex?: number) => {
     if (!scenario) return;
 
     cancelledRef.current = false;
     setLastError(null);
     setStepErrors({});
+    const chain = buildScenarioRunChain(scenario, getScenarioById);
+    runChainRef.current = chain;
+    setDisplayScenario(scenario);
+    setChainMeta(
+      chain.length > 1 ? { part: 1, total: chain.length } : null,
+    );
 
     if (isChromeExtension()) {
       try {
@@ -305,10 +334,13 @@ export default function ScenarioRunner() {
         await sendMessage({
           type: "RUN_SCENARIO",
           scenario,
+          scenarios: chain.length > 1 ? chain : undefined,
           tabId,
           stepDelayMs: getStepDelayMs(),
           validationOnly,
           apiKey: getApiKey(),
+          llmProvider: getLlmProvider(),
+          startFromIndex,
         });
       } catch (err) {
         if (isContextInvalidated(err)) {
@@ -442,8 +474,9 @@ export default function ScenarioRunner() {
       </div>
     );
 
+  const stepsForUi = displayScenario?.steps ?? scenario.steps;
   const hasStarted = currentStepIndex >= 0;
-  const lastStepId = scenario.steps[scenario.steps.length - 1]?.id;
+  const lastStepId = stepsForUi[stepsForUi.length - 1]?.id;
   const lastStepStatus = lastStepId ? stepStatuses[lastStepId] : null;
   const hasFinished =
     hasStarted &&
@@ -451,15 +484,18 @@ export default function ScenarioRunner() {
     (lastError != null ||
       lastStepStatus === "success" ||
       lastStepStatus === "failed");
+  const canStartFromStep = hasFinished || (hasStarted && !isRunning);
 
   const handleRestart = () => {
     cancelledRef.current = false;
     setLastError(null);
     setStepErrors({});
     setCurrentStepIndex(-1);
+    setDisplayScenario(scenario);
+    setChainMeta(null);
     setStepStatuses((prev) => {
       const next: Record<string, StepStatus> = {};
-      scenario.steps.forEach((step) => {
+      (scenario?.steps ?? []).forEach((step) => {
         next[step.id] = "idle";
       });
       return next;
@@ -491,6 +527,11 @@ export default function ScenarioRunner() {
               title="클릭하여 제목 수정"
             />
           </div>
+          {chainMeta && chainMeta.total > 1 && (
+            <div className="pl-9 text-[11px] text-violet-600 font-semibold">
+              체인 {chainMeta.part}/{chainMeta.total} · {displayScenario?.title}
+            </div>
+          )}
           <div className="flex items-center gap-2 pl-9">
             {isRunning ? (
               <>
@@ -548,7 +589,7 @@ export default function ScenarioRunner() {
           <div className="absolute left-6 top-4 bottom-4 w-0.5 bg-gray-100" />
 
           <div className="space-y-6 relative pl-1">
-            {scenario.steps.map((step, index) => {
+            {stepsForUi.map((step, index) => {
               const status = stepStatuses[step.id] || "idle";
               const actionDef = ACTION_REGISTRY[step.actionId];
               const isMissing =
@@ -659,6 +700,19 @@ export default function ScenarioRunner() {
                         </button>
                       </div>
                     )}
+
+                    {canStartFromStep && (
+                      <div className="mt-2 pt-2 border-t border-gray-100 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => handleStart(index)}
+                          className="text-[11px] text-[var(--flux-primary)] hover:bg-[var(--flux-primary-muted)] px-2 py-1 rounded-md transition-colors font-medium flex items-center gap-1"
+                        >
+                          <SkipForward className="w-3 h-3" />
+                          이 스텝부터 실행
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               );
@@ -681,7 +735,7 @@ export default function ScenarioRunner() {
               ) : !hasStarted ? (
                 <button
                   type="button"
-                  onClick={handleStart}
+                  onClick={() => handleStart()}
                   className="w-full py-3 rounded-xl font-medium text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98] border border-[var(--flux-primary)] text-[var(--flux-primary)] bg-transparent hover:bg-[var(--flux-primary-muted)] hover:border-[var(--flux-primary-hover)]"
                 >
                   <Play className="w-4 h-4 fill-current" />

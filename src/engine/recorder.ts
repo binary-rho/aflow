@@ -53,7 +53,10 @@ export interface RecordedSelectEvent {
 export interface RecordedCheckEvent {
   type: "check";
   label: string;
-  checked: boolean;
+  /** true: 목표 checked 없이 한 번 클릭만 (토글). 녹화 기본값 */
+  clickOnly?: boolean;
+  /** clickOnly가 아닐 때만: 클릭 후 기대 체크 상태 (레거시/수동 DSL) */
+  checked?: boolean;
   selector?: string | null;
   context?: string | null;
   ts: number;
@@ -109,20 +112,73 @@ const INJECT_SCRIPT = `
     return String(value).replace(/[^a-zA-Z0-9_-]/g, '\\\\$&');
   }
 
+  function isLikelyStableId(id) {
+    if (!id) return false;
+    var value = String(id).trim();
+    if (!value) return false;
+    var lower = value.toLowerCase();
+    if (lower.indexOf('_uid_') === 0 || lower.indexOf('uid_') === 0 || lower.indexOf('ember') === 0 || lower.indexOf('headlessui-') === 0) {
+      return false;
+    }
+    return true;
+  }
+
+  function isLikelyStableName(name) {
+    if (!name) return false;
+    var value = String(name).trim().toLowerCase();
+    if (!value) return false;
+    if (value.indexOf('_uid_') === 0 || value.indexOf('uid_') === 0) return false;
+    return true;
+  }
+
+  function buildAttrSelector(tagName, attrName, attrValue) {
+    if (!attrValue) return null;
+    return tagName + '[' + attrName + '="' + String(attrValue).replace(/"/g, '\\\\"') + '"]';
+  }
+
   function getSelector(el) {
     if (!el || !(el instanceof Element)) return null;
-    if (el.id) return '#' + escapeCss(el.id);
+    var tagName = el.tagName.toLowerCase();
+    if (el.id && isLikelyStableId(el.id)) return '#' + escapeCss(el.id);
 
     var dataTestId = el.getAttribute('data-testid');
-    if (dataTestId) return '[data-testid=\"' + dataTestId.replace(/\"/g, '\\\\\"') + '\"]';
+    var dataTestSelector = buildAttrSelector(tagName, 'data-testid', dataTestId);
+    if (dataTestSelector) return dataTestSelector;
     var dataTest = el.getAttribute('data-test');
-    if (dataTest) return '[data-test=\"' + dataTest.replace(/\"/g, '\\\\\"') + '\"]';
+    var dataTestSimpleSelector = buildAttrSelector(tagName, 'data-test', dataTest);
+    if (dataTestSimpleSelector) return dataTestSimpleSelector;
+
+    var gtmLabel = el.getAttribute('data-gtm-event-label');
+    var gtmLabelSelector = buildAttrSelector(tagName, 'data-gtm-event-label', gtmLabel);
+    if (gtmLabelSelector) return gtmLabelSelector;
+
+    var gtmClickText = el.getAttribute('data-gtm-click-text');
+    var gtmClickTextSelector = buildAttrSelector(tagName, 'data-gtm-click-text', gtmClickText);
+    if (gtmClickTextSelector) return gtmClickTextSelector;
+
+    var ecProduct = el.getAttribute('data-ec-product_id');
+    var ecProductSelector = buildAttrSelector(tagName, 'data-ec-product_id', ecProduct);
+    if (ecProductSelector) return ecProductSelector;
 
     var name = el.getAttribute('name');
-    if (name) return el.tagName.toLowerCase() + '[name=\"' + name.replace(/\"/g, '\\\\\"') + '\"]';
+    if (isLikelyStableName(name)) {
+      var nameSelector = buildAttrSelector(tagName, 'name', name);
+      if (nameSelector) return nameSelector;
+    }
 
     var ariaLabel = el.getAttribute('aria-label');
-    if (ariaLabel) return el.tagName.toLowerCase() + '[aria-label=\"' + ariaLabel.replace(/\"/g, '\\\\\"') + '\"]';
+    var ariaLabelSelector = buildAttrSelector(tagName, 'aria-label', ariaLabel);
+    if (ariaLabelSelector) return ariaLabelSelector;
+
+    var gtmContainer = el.closest('[data-gtm-event-label]');
+    if (gtmContainer) {
+      var containerLabel = gtmContainer.getAttribute('data-gtm-event-label');
+      if (containerLabel) {
+        var clickable = el.closest('button, a, [role="button"], [role="link"]');
+        var clickableTag = clickable ? clickable.tagName.toLowerCase() : tagName;
+        return '[data-gtm-event-label="' + containerLabel.replace(/"/g, '\\\\"') + '"] ' + clickableTag;
+      }
+    }
 
     var parts = [];
     var node = el;
@@ -145,7 +201,12 @@ const INJECT_SCRIPT = `
   }
 
   function getContext(el) {
-    var parent = el.closest('li, article, section, .card, [class*="card"], [role="dialog"], .modal, [class*="modal"], nav, header') || el.parentElement;
+    var gtmContainer = el.closest('[data-gtm-event-label]');
+    if (gtmContainer) {
+      var gtmLabel = gtmContainer.getAttribute('data-gtm-event-label');
+      if (gtmLabel) return gtmLabel.trim().slice(0, 100);
+    }
+    var parent = el.closest('li, article, section, dl, .card, [class*="card"], [class*="product"], [class*="priceplan"], [role="dialog"], .modal, [class*="modal"], nav, header') || el.parentElement;
     if (!parent) return null;
     return norm(parent.textContent || '').slice(0, 80) || null;
   }
@@ -195,7 +256,6 @@ const INJECT_SCRIPT = `
       lastCheckEl = checkTarget;
       lastCheckTs = now;
       var chkLabel = getFieldLabel(checkTarget);
-      var checked = checkTarget.checked !== undefined ? !checkTarget.checked : true;
       var chkSelector = getSelector(checkTarget);
       var chkContext = getContext(checkTarget);
 
@@ -219,7 +279,7 @@ const INJECT_SCRIPT = `
         }
       }
 
-      send({ type: 'check', label: chkLabel || chkSelector || '', checked: checked, selector: chkSelector, context: chkContext, ts: Date.now() });
+      send({ type: 'check', label: chkLabel || chkSelector || '', clickOnly: true, selector: chkSelector, context: chkContext, ts: Date.now() });
       return;
     }
 
@@ -314,8 +374,8 @@ const INJECT_SCRIPT = `
 let activeTabId: number | null = null;
 let collectedLogs: RecordedEvent[] = [];
 let startUrl = "";
-let debuggerEventListener: ((source: { tabId: number }, method: string, params?: any) => void) | null = null;
-let bindingListener: ((source: { tabId: number }, method: string, params?: any) => void) | null = null;
+let debuggerEventListener: ((source: chrome.debugger.Debuggee, method: string, params?: any) => void) | null = null;
+let bindingListener: ((source: chrome.debugger.Debuggee, method: string, params?: any) => void) | null = null;
 let tabCreatedListener: ((tab: chrome.tabs.Tab) => void) | null = null;
 const attachedRecordingTabs = new Set<number>();
 
@@ -354,8 +414,9 @@ export async function startRecording(tabId: number): Promise<void> {
   await sendCmd(tabId, "Runtime.enable");
   await sendCmd(tabId, "Runtime.addBinding", { name: BINDING_NAME });
 
-  bindingListener = (source: { tabId: number }, method: string, params?: any) => {
-    if (!attachedRecordingTabs.has(source.tabId)) return;
+  bindingListener = (source: chrome.debugger.Debuggee, method: string, params?: any) => {
+    const sourceTabId = source.tabId;
+    if (sourceTabId == null || !attachedRecordingTabs.has(sourceTabId)) return;
     if (method === "Runtime.bindingCalled" && params?.name === BINDING_NAME) {
       try {
         const event = JSON.parse(params.payload) as RecordedEvent;
@@ -365,7 +426,7 @@ export async function startRecording(tabId: number): Promise<void> {
     if (method === "Page.frameNavigated" && (!params?.frame?.parentId)) {
       const url = params?.frame?.url || "";
       collectedLogs.push({ type: "nav", url, ts: Date.now() });
-      setTimeout(() => injectRecorderScript(source.tabId), 500);
+      setTimeout(() => injectRecorderScript(sourceTabId), 500);
     }
   };
   chrome.debugger.onEvent.addListener(bindingListener);

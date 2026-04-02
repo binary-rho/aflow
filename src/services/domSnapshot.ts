@@ -28,6 +28,7 @@ export function formatPageSummaryForLLM(summary: PageSummaryPayload): string {
       parts.push("  - \"" + (c.text ? maskPII(c.text) : "(no text)") + "\"");
       if (c.role) parts.push("[" + c.role + "]");
       if (c.context) parts.push("in " + c.context);
+      if (c.gtmText) parts.push("gtm \"" + c.gtmText + "\"");
       if (c.selector) parts.push("→ " + c.selector);
       lines.push(parts.join(" "));
     }
@@ -61,6 +62,7 @@ export interface PageSummaryPayload {
     role: string | null;
     selector: string | null;
     context: string | null;
+    gtmText: string | null;
   }[];
   formFields: {
     name: string | null;
@@ -93,8 +95,14 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
       .replace(/\\b[A-Za-z0-9+/=]{40,}\\b/g, '[긴문자열 마스킹]');
   }
   function text(el) {
-    var parts = [el.innerText || '', el.textContent || '', el.getAttribute('aria-label') || ''];
-    [].slice.call(el.querySelectorAll('img[alt]')).forEach(function(im) { parts.push(im.getAttribute('alt') || ''); });
+    var main = (el.innerText || el.textContent || '').trim();
+    var al = (el.getAttribute('aria-label') || '').trim();
+    var parts = [main];
+    if (al && main.indexOf(al) < 0) parts.push(al);
+    [].slice.call(el.querySelectorAll('img[alt]')).forEach(function(im) {
+      var a = (im.getAttribute('alt') || '').trim();
+      if (a && main.indexOf(a) < 0) parts.push(a);
+    });
     var t = parts.join(' ').trim().replace(/\\s+/g, ' ');
     return t ? mask(t).slice(0, 200) : null;
   }
@@ -108,7 +116,10 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
   function getContext(el) {
     var cur = el.parentElement;
     var d = 0;
-    while (cur && d < 8 && cur !== document.body) {
+    var innerCtx = null;
+    var containerType = null;
+    var headings = [];
+    while (cur && d < 10 && cur !== document.body) {
       d++;
       var tag = cur.tagName.toLowerCase();
       var role = (cur.getAttribute('role') || '').trim();
@@ -116,18 +127,52 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
       var isSemantic = 'section article nav header footer main aside form dialog'.split(' ').indexOf(tag) >= 0;
       var isRole = 'region navigation banner contentinfo main dialog form search'.split(' ').indexOf(role) >= 0;
       var ctxClass = cls ? (cls.split(/\\s+/).filter(function(c) {
-        return /(card|item|product|banner|slide|menu|tab|modal|panel|group|login|signup|search|filter|content|area)/i.test(c);
+        return /(card|item|product|banner|slide|menu|tab|modal|panel|group|login|signup|search|filter|content|area|popup|popover|bottomsheet|bottom-sheet|tooltip|toast|snackbar|drawer|overlay|layer)/i.test(c);
       })[0] || null) : null;
-      if (isSemantic || isRole || ctxClass) {
-        var hEl = cur.querySelector('h1, h2, h3, h4');
-        var ht = hEl ? mask((hEl.innerText || '').trim().replace(/\\s+/g, ' ')).slice(0, 60) : null;
-        var al = (cur.getAttribute('aria-label') || '').trim().slice(0, 60) || null;
+      if (!containerType) {
+        if (tag === 'dialog' || role === 'dialog' || role === 'alertdialog') containerType = 'dialog';
+        else if (/(bottom[-_]?sheet|bottomsheet)/i.test(cls)) containerType = 'bottomsheet';
+        else if (role === 'tooltip') containerType = 'tooltip';
+        else if (/(popup|popover)/i.test(cls) || cur.hasAttribute('popover')) containerType = 'popup';
+        else if (cur.getAttribute('aria-modal') === 'true' || /\bmodal\b/i.test(cls)) containerType = 'modal';
+        else if (/(toast|snackbar)/i.test(cls) || role === 'status') containerType = 'toast';
+      }
+      var hEl = cur.querySelector('h1, h2, h3, h4, h5, h6, [role="heading"]');
+      var ht = hEl ? mask((hEl.innerText || '').trim().replace(/\\s+/g, ' ')).slice(0, 60) : null;
+      if (!ht) {
+        for (var ci = 0; ci < Math.min(cur.children.length, 5); ci++) {
+          var ch = cur.children[ci];
+          if (!ch || !ch.tagName) continue;
+          var chtag = ch.tagName.toLowerCase();
+          if (chtag === 'section' || chtag === 'ul' || chtag === 'ol' || chtag === 'table' || chtag === 'form') continue;
+          if (ch.querySelector && ch.querySelector('section, article, ul, ol, table')) continue;
+          var chtx = mask((ch.innerText || '').trim().replace(/\\s+/g, ' ')).slice(0, 60);
+          if (chtx && chtx.length >= 2 && chtx.length <= 60) { ht = chtx; break; }
+        }
+      }
+      var al = (cur.getAttribute('aria-label') || '').trim().slice(0, 60) || null;
+      if (ht && headings.indexOf(ht) < 0) headings.push(ht);
+      if ((isSemantic || isRole || ctxClass) && !innerCtx) {
         var name = ctxClass || (role && role !== tag ? role : tag);
         var desc = ht || al;
-        return desc ? name + '("' + desc + '")' : name;
+        innerCtx = desc ? name + '("' + desc + '")' : name;
       }
       cur = cur.parentElement;
     }
+    if (containerType && innerCtx && innerCtx.indexOf(containerType) < 0) {
+      innerCtx = containerType + ' > ' + innerCtx;
+    } else if (containerType && !innerCtx) {
+      innerCtx = containerType;
+    }
+    var outerHeading = headings.length > 1 ? headings[headings.length - 1] : null;
+    if (innerCtx) {
+      if (outerHeading && innerCtx.indexOf(outerHeading) < 0) {
+        return innerCtx + ' in heading("' + outerHeading + '")';
+      }
+      return innerCtx;
+    }
+    if (outerHeading) return 'heading("' + outerHeading + '")';
+    if (headings.length > 0) return 'heading("' + headings[0] + '")';
     return null;
   }
   function buildSelector(el) {
@@ -264,7 +309,8 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
       if (!t && !el.getAttribute('role')) return;
       var sel = buildSelector(el);
       var ctx = getContext(el);
-      ctas.push({ text: t, role: (el.getAttribute('role') || '').trim() || null, selector: sel, context: ctx });
+      var gtm = (el.getAttribute('data-gtm-click-text') || '').trim() || null;
+      ctas.push({ text: t, role: (el.getAttribute('role') || '').trim() || null, selector: sel, context: ctx, gtmText: gtm });
     });
     if (ctas.length > 80) ctas = ctas.slice(0, 80);
     var formFields = [];

@@ -19,6 +19,9 @@ export interface ScenarioStep {
   description?: string; // Optional override description
 }
 
+/** 후속 시나리오 체인 최대 길이 (순환 방지) */
+export const SCENARIO_CHAIN_MAX = 8;
+
 export interface Scenario {
   id: string;
   title: string;
@@ -28,6 +31,8 @@ export interface Scenario {
   groupIds?: string[];
   steps: ScenarioStep[];
   createdAt: string;
+  /** 이 시나리오 성공 직후, 같은 탭에서 이어서 실행할 시나리오 id (첫 nav.goto 생략) */
+  followUpScenarioId?: string;
 }
 
 export interface ScenarioGroup {
@@ -112,7 +117,7 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition> = {
   'form.input_phone':      { id: 'form.input_phone', name: '전화번호 입력', description: '전화번호 입력 필드에 값을 입력합니다.', status: 'missing', params: ['phoneNumber'] },
   'form.search':           { id: 'form.search', name: '검색어 입력', description: '검색 컴포넌트에 검색어를 입력하고 검색합니다.', status: 'missing', params: ['keyword'] },
   'form.input_clear':      { id: 'form.input_clear', name: '입력값 삭제', description: '입력 필드의 삭제(X) 버튼을 클릭하여 값을 초기화합니다.', status: 'missing', params: ['selector'] },
-  'form.check':            { id: 'form.check', name: '체크박스/라디오 토글', description: '체크박스 또는 라디오 버튼을 클릭하여 상태를 변경합니다.', status: 'implemented', params: ['label', 'checked', 'selector', 'context'] },
+  'form.check':            { id: 'form.check', name: '체크박스/라디오 토글', description: '체크박스 또는 라디오를 클릭합니다. clickOnly:true면 목표 상태 없이 한 번 클릭(토글), 아니면 checked로 목표 on/off를 맞춥니다.', status: 'implemented', params: ['label', 'selector', 'context', 'clickOnly', 'checked'] },
   'form.checkbox_check':   { id: 'form.checkbox_check', name: '체크박스 선택/해제', description: '체크박스의 체크 상태를 변경합니다.', status: 'implemented', params: ['selector', 'label', 'checked'] },
   'form.checkbox_all':     { id: 'form.checkbox_all', name: '전체 선택/해제', description: '전체 동의, 전체 선택 체크박스를 토글합니다.', status: 'missing', params: ['selector', 'checked'] },
   'form.radio_select':     { id: 'form.radio_select', name: '라디오 버튼 선택', description: '라디오 그룹에서 옵션을 선택합니다.', status: 'implemented', params: ['name', 'value'] },
@@ -166,6 +171,7 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition> = {
   'scroll.to_top':         { id: 'scroll.to_top', name: '최상단 스크롤', description: '페이지 최상단으로 스크롤합니다.', status: 'missing', params: [] },
   'scroll.to_section':     { id: 'scroll.to_section', name: '섹션으로 스크롤', description: '특정 섹션/요소로 스크롤합니다.', status: 'missing', params: ['selector', 'refName', 'behavior'] },
   'scroll.to_element':     { id: 'scroll.to_element', name: '요소로 스크롤', description: '특정 DOM 요소가 보일 때까지 스크롤합니다.', status: 'missing', params: ['selector'] },
+  'scroll.by':             { id: 'scroll.by', name: '상대 스크롤', description: '현재 위치에서 delta만큼 스크롤. 가로만(deltaX)이면 탭바 등 가로 스크롤 영역을 자동 탐색.', status: 'implemented', params: ['deltaX', 'deltaY', 'selector'] },
   'scroll.page':           { id: 'scroll.page', name: '페이지 스크롤', description: '페이지를 특정 방향/량만큼 스크롤합니다.', status: 'missing', params: ['direction', 'amount'] },
   'scroll.pagination':     { id: 'scroll.pagination', name: '페이지네이션 이동', description: '특정 페이지 번호를 클릭합니다.', status: 'missing', params: ['pageNo'] },
   'scroll.tab_center':     { id: 'scroll.tab_center', name: '탭 중앙 스크롤', description: '선택된 탭이 가운데로 오도록 가로 스크롤합니다.', status: 'missing', params: ['tabIndex'] },

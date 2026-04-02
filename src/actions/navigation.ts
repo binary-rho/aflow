@@ -7,6 +7,9 @@ function resolveNavigateUrl(url: string, tabUrl: string | undefined): string {
   if (!trimmed) return url;
   const isAbsolute = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
   if (isAbsolute) return trimmed;
+  // 호스트 형태(예: m.qa-sh.uhdcsre.com/apcm/main)면 상대경로로 해석되며 URL이 반복되므로, https:// 붙여 절대 URL로 처리
+  const looksLikeHostPath = /^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/.test(trimmed);
+  if (looksLikeHostPath) return "https://" + trimmed;
   if (!tabUrl) {
     throw new Error(
       "상대 경로(/)로 이동하려면 검사 중인 탭이 열려 있어야 합니다. https:// 로 시작하는 전체 URL을 사용하거나, 해당 페이지를 연 탭에서 실행해주세요.",
@@ -52,4 +55,19 @@ export const scrollToAction: ActionFn = async (tabId, params, options) => {
     throw new Error("scroll.to requires a numeric 'y' param");
   }
   await cdp.scrollToPosition(tabId, Number.isFinite(x) ? x : 0, y);
+};
+
+/** 상대 스크롤. DRR 스크롤 동작 확인용. deltaX만 있으면 가로 탭 영역 등 자동 탐색. */
+export const scrollByAction: ActionFn = async (tabId, params, options) => {
+  if (options?.validationOnly) return;
+  const deltaY = Number(params?.deltaY ?? params?.dy ?? 0);
+  const deltaX = Number(params?.deltaX ?? params?.dx ?? 0);
+  const selector = typeof params?.selector === "string" ? params.selector : undefined;
+  if (!Number.isFinite(deltaY) || !Number.isFinite(deltaX)) {
+    throw new Error("scroll.by requires numeric deltaX and/or deltaY");
+  }
+  if (deltaX === 0 && deltaY === 0) {
+    throw new Error("scroll.by needs non-zero deltaX or deltaY");
+  }
+  await cdp.scrollByDelta(tabId, deltaX, deltaY, selector);
 };

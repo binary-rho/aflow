@@ -10,6 +10,8 @@ interface SectionProps {
   count?: number;
   headerAction?: React.ReactNode;
   className?: string;
+  /** true면 남은 세로 공간을 채우고, 내용만 내부 스크롤 (목록용) */
+  fillRemaining?: boolean;
 }
 
 export function Section({
@@ -20,6 +22,7 @@ export function Section({
   count,
   headerAction,
   className,
+  fillRemaining = false,
 }: SectionProps) {
   const [isOpen, setIsOpen] = useState(defaultOpen);
 
@@ -27,6 +30,7 @@ export function Section({
     <div
       className={cn(
         "border-b border-[var(--flux-border-light)] last:border-0 bg-white mb-1 mx-3 pb-1 last:pb-0 last:mb-0 min-w-0",
+        fillRemaining && "flex-1 min-h-0 flex flex-col",
         className
       )}
     >
@@ -72,8 +76,12 @@ export function Section({
 
       <div
         className={cn(
-          "overflow-hidden transition-all duration-300 ease-in-out bg-white relative z-0",
-          isOpen ? "max-h-[800px] opacity-100" : "max-h-0 opacity-0"
+          "transition-all duration-300 ease-in-out bg-white relative z-0",
+          isOpen
+            ? "opacity-100 overflow-y-auto overflow-x-hidden scrollbar-hide min-h-0"
+            : "max-h-0 opacity-0 overflow-hidden",
+          isOpen && fillRemaining && "flex-1 min-h-0",
+          isOpen && !fillRemaining && "max-h-[800px]"
         )}
       >
         <div className="pb-4 pt-1 px-1">{children}</div>

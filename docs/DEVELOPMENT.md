@@ -51,7 +51,6 @@ src/
 │   ├── scenarioStore.ts  # 시나리오 CRUD
 │   ├── groupsStore.ts    # 시나리오 그룹 관리
 │   ├── settingsStore.ts  # API 키, 속도 프리셋
-│   ├── domCacheStore.ts  # 방문 페이지 DOM 캐시
 │   └── domCaptureStore.ts # 실행 중 DOM 캡처
 ├── app/                  # UI 레이어
 │   ├── pages/
@@ -189,7 +188,7 @@ RecordedEvent[] ──> background.ts ──>   시나리오 실행 (runner.ts)
 3. 스텝 순차 실행: `executeAction(tabId, actionId, params, options)`
 4. 각 스텝 사이에 속도 프리셋에 따른 딜레이
 5. 스텝 실행 후 새 탭 열림 감지 -> 자동 전환
-6. DOM 스냅샷 캡처 (학습용)
+6. 스텝마다 DOM 스냅샷 캡처 (마지막 실행 기록용, `domCaptureStore`)
 7. 완료/에러/취소 시 CDP detach
 
 ### 5.2 새 탭 자동 전환
@@ -242,7 +241,7 @@ detachFromTab(tabId): refCount-- (0이 될 때만 실제 detach)
 ### 6.2 변환 파이프라인
 
 1. 토큰 칩 파싱 -> 구조화된 입력
-2. 방문한 페이지의 DOM 요약 첨부 (학습된 페이지)
+2. **현재 검사 중 탭**의 DOM 요약 첨부 (선택적, 변환 시점 1페이지만)
 3. LLM 호출 (SYSTEM_PROMPT + 사용자 입력 + DOM 컨텍스트)
 4. JSON DSL 응답 파싱
 5. `baseUrl` 후처리 (example.com -> 실제 호스트)
@@ -254,8 +253,8 @@ detachFromTab(tabId): refCount-- (0이 될 때만 실제 detach)
 
 ### 7.1 수집 방식
 
-페이지 이동 시 자동으로 DOM 요약을 수집하여 캐시합니다.
-DRR 변환 시 모든 방문 페이지의 DOM 정보가 LLM에 전달됩니다.
+- **DRR → DSL 변환:** 변환 버튼을 누를 때, 검사 중인 탭에서 **그 시점 한 페이지**의 DOM 요약만 수집해 LLM에 전달합니다. (도메인별 다중 페이지 캐시는 사용하지 않음.)
+- **시나리오 실행:** 각 스텝 실행 시 CDP로 실시간 DOM을 캡처해 요소 매칭에 사용합니다.
 
 ### 7.2 수집 내용
 
@@ -282,8 +281,6 @@ DRR 변환 시 모든 방문 페이지의 DOM 정보가 LLM에 전달됩니다.
 - 변환 결과 DSL 표시 + 클립보드 복사
 - 직접 생성 (녹화) 버튼
 - 검증 버튼 (카드별, 진행 상태 토스트)
-- 학습된 페이지 수 표시 + info 툴팁
-- DOM 캐시 초기화
 
 ### 8.2 시나리오 실행 (ScenarioRunner)
 

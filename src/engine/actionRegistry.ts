@@ -6,7 +6,7 @@ export type StepResult = {
   error?: string;
 };
 
-export type ExecuteActionOptions = { validationOnly?: boolean; apiKey?: string };
+export type ExecuteActionOptions = { validationOnly?: boolean; apiKey?: string; llmProvider?: string };
 
 export async function executeAction(
   tabId: number,

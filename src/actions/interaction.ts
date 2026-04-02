@@ -4,53 +4,118 @@ import type { ActionFn } from "./index";
 
 const CLICKABLE_BY_TEXT_SELECTOR = "button, a, [role='button'], [role='link']";
 
+const isDynamicSelector = (s: string | undefined | null): boolean =>
+  !!s && /_uid_|^#[\w-]*uid[\w-]*\d|\[name=["']?_[^"']*uid/i.test(s);
+
+const MAX_SCROLL_RETRIES = 6;
+
+/**
+ * 클릭 함수가 "not found" 에러로 실패하면 페이지를 스크롤 다운하며 재시도.
+ * lazy render로 뷰포트 밖 요소가 아직 DOM에 없는 경우를 대응.
+ */
+async function withScrollRetry(
+  tabId: number,
+  fn: () => Promise<void>,
+): Promise<void> {
+  for (let attempt = 0; attempt <= MAX_SCROLL_RETRIES; attempt++) {
+    try {
+      await fn();
+      return;
+    } catch (err: any) {
+      const isNotFound =
+        err?.message?.includes("not found") ||
+        err?.message?.includes("찾을 수 없");
+      if (!isNotFound || attempt === MAX_SCROLL_RETRIES) throw err;
+      const atBottom = await cdp.isAtPageBottom(tabId);
+      if (atBottom) throw err;
+      console.log(`[flux] element not found, scrolling down (attempt ${attempt + 1}/${MAX_SCROLL_RETRIES})`);
+      await cdp.scrollDownByViewport(tabId);
+    }
+  }
+}
+
 export const clickButtonAction: ActionFn = async (tabId, params, options) => {
   const skipClick = options?.validationOnly;
-  const selector = params?.selector;
+  let selector = params?.selector;
   const text = params?.text;
   const context = params?.context;
   const apiKey = options?.apiKey;
+  const llmProvider = options?.llmProvider;
+
+  if (isDynamicSelector(selector)) selector = undefined;
 
   if (selector) {
+    let selectorWorked = false;
     try {
-      await cdp.click(tabId, selector, { skipClick });
-      return;
-    } catch {
-      if (text) {
-        await cdp.clickByText(tabId, text, CLICKABLE_BY_TEXT_SELECTOR, { skipClick });
-        return;
+      let selectorValid = true;
+      if (text || context) {
+        selectorValid = await cdp.evaluate(
+          tabId,
+          `(() => {
+            const selector = ${JSON.stringify(selector)};
+            const expectedText = ${JSON.stringify(text || "")};
+            const expectedContext = ${JSON.stringify(context || "")};
+            const norm = (s) => (s || "").trim().replace(/\\s+/g, " ");
+            const key = (s) => norm(s).replace(/\\s+/g, "").replace(/[\\u207A\\u2B]/g, "+").toLowerCase();
+            const el = document.querySelector(selector);
+            if (!el) return false;
+            const elKey = key((el.innerText || el.textContent || "").trim());
+            const textKey = key(expectedText);
+            const isTextMatched = !textKey || elKey === textKey || elKey.includes(textKey) || textKey.includes(elKey);
+            return isTextMatched;
+          })()`,
+        );
       }
-      throw new Error(`Element not found by selector "${selector}" and no text fallback`);
+      if (selectorValid) {
+        await cdp.click(tabId, selector, { skipClick });
+        selectorWorked = true;
+      }
+    } catch {
+      console.warn(`[flux] selector failed: "${selector}"`);
     }
+    if (selectorWorked) return;
+    if (!text) throw new Error(`Element not found by selector "${selector}" and no text fallback`);
+    console.log(`[flux] selector invalid, falling through to text matching: "${text}"`);
   }
 
   if (text) {
+    console.log(`[flux] button.click: text="${text}", context="${context ?? "(none)"}"`);
     if (apiKey) {
       const resolved = await resolveElement(
         tabId,
         { action: "button.click", text, context },
         apiKey,
+        llmProvider,
       );
       if (resolved) {
+        console.log(`[flux] resolveElement → ${resolved.matchedBy}: "${resolved.selector}"`);
         try {
           await cdp.click(tabId, resolved.selector, { skipClick });
           return;
-        } catch {
-          // resolved selector failed at runtime — fall through to clickByText
+        } catch (err: any) {
+          console.warn(`[flux] resolved selector click failed: ${err?.message}`);
         }
+      } else {
+        console.log("[flux] resolveElement → no match");
       }
     }
     if (context) {
       try {
-        await cdp.clickByTextWithContext(tabId, text, context, CLICKABLE_BY_TEXT_SELECTOR, {
-          skipClick,
-        });
+        console.log("[flux] fallback → clickByTextWithContext");
+        await withScrollRetry(tabId, () =>
+          cdp.clickByTextWithContext(tabId, text, context, CLICKABLE_BY_TEXT_SELECTOR, {
+            skipClick,
+          }),
+        );
         return;
-      } catch {
-        // context fallback failed — fall through to text-only click
+      } catch (err: any) {
+        console.warn(`[flux] clickByTextWithContext failed: ${err?.message}`);
       }
     }
-    await cdp.clickByText(tabId, text, CLICKABLE_BY_TEXT_SELECTOR, { skipClick });
+    console.log("[flux] final fallback → clickByText (no context, picks topmost)");
+    await withScrollRetry(tabId, () =>
+      cdp.clickByText(tabId, text, CLICKABLE_BY_TEXT_SELECTOR, { skipClick }),
+    );
   } else {
     throw new Error("button.click requires 'text' or 'selector' param");
   }
@@ -63,32 +128,88 @@ export const gnbClickLoginAction: ActionFn = async (tabId, _params, options) => 
 
 const HOVERABLE_SELECTOR = 'nav a, nav button, [role="menuitem"], [class*="menu"] a, [class*="menu"] button, [class*="gnb"] a, [class*="gnb"] button, [role="tab"], header a, header button, a, button, [role="button"]';
 
-export const hoverAction: ActionFn = async (tabId, params) => {
-  const selector = params?.selector;
+export const hoverAction: ActionFn = async (tabId, params, options) => {
+  const selector = isDynamicSelector(params?.selector) ? undefined : params?.selector;
   const text = params?.text;
+  const context = params?.context;
+  const apiKey = options?.apiKey;
+  const llmProvider = options?.llmProvider;
 
   if (selector) {
+    let selectorWorked = false;
     try {
-      await cdp.hover(tabId, selector);
-      return;
-    } catch {
       if (text) {
-        await cdp.hoverByText(tabId, text, HOVERABLE_SELECTOR);
-        return;
+        const selectorValid = await cdp.evaluate(
+          tabId,
+          `(() => {
+            const el = document.querySelector(${JSON.stringify(selector)});
+            if (!el) return false;
+            const norm = (s) => (s || '').trim().replace(/\\s+/g, '').replace(/[\\u207A\\u2B]/g, '+').toLowerCase();
+            const elKey = norm(el.innerText || el.textContent || '');
+            const textKey = norm(${JSON.stringify(text)});
+            return !textKey || elKey.includes(textKey) || textKey.includes(elKey);
+          })()`,
+        );
+        if (selectorValid) {
+          await cdp.hover(tabId, selector);
+          selectorWorked = true;
+        }
+      } else {
+        await cdp.hover(tabId, selector);
+        selectorWorked = true;
       }
-      throw new Error(`Hover target not found by selector "${selector}" and no text fallback`);
+    } catch {
+      console.warn(`[flux] hover selector failed: "${selector}"`);
     }
+    if (selectorWorked) return;
+    if (!text) throw new Error(`Hover target not found by selector "${selector}" and no text fallback`);
+    console.log(`[flux] hover selector invalid, falling through to text matching: "${text}"`);
   }
 
   if (text) {
-    await cdp.hoverByText(tabId, text, HOVERABLE_SELECTOR);
+    console.log(`[flux] interaction.hover: text="${text}", context="${context ?? "(none)"}"`);
+
+    if (apiKey) {
+      const resolved = await resolveElement(
+        tabId,
+        { action: "button.click", text, context },
+        apiKey,
+        llmProvider,
+      );
+      if (resolved) {
+        console.log(`[flux] hover resolveElement → ${resolved.matchedBy}: "${resolved.selector}"`);
+        try {
+          await cdp.hover(tabId, resolved.selector);
+          return;
+        } catch (err: any) {
+          console.warn(`[flux] hover resolved selector failed: ${err?.message}`);
+        }
+      }
+    }
+
+    if (context) {
+      try {
+        console.log("[flux] hover fallback → hoverByTextWithContext");
+        await withScrollRetry(tabId, () =>
+          cdp.hoverByTextWithContext(tabId, text, context, HOVERABLE_SELECTOR),
+        );
+        return;
+      } catch (err: any) {
+        console.warn(`[flux] hoverByTextWithContext failed: ${err?.message}`);
+      }
+    }
+
+    console.log("[flux] hover final fallback → hoverByText (no context)");
+    await withScrollRetry(tabId, () =>
+      cdp.hoverByText(tabId, text, HOVERABLE_SELECTOR),
+    );
   } else {
     throw new Error("interaction.hover requires 'text' or 'selector' param");
   }
 };
 
 export const selectOptionAction: ActionFn = async (tabId, params, options) => {
-  const selector = params?.selector;
+  const selector = isDynamicSelector(params?.selector) ? undefined : params?.selector;
   const label = params?.label;
   const value = params?.value;
 
@@ -120,11 +241,12 @@ export const selectOptionAction: ActionFn = async (tabId, params, options) => {
 };
 
 export const fillFormAction: ActionFn = async (tabId, params, options) => {
-  const selector = params?.selector;
+  const selector = isDynamicSelector(params?.selector) ? undefined : params?.selector;
   const label = params?.label;
   const value = params?.value;
   const context = params?.context;
   const apiKey = options?.apiKey;
+  const llmProvider = options?.llmProvider;
 
   if (!value && !options?.validationOnly) {
     throw new Error("form.fill requires 'value' param");
@@ -163,6 +285,7 @@ export const fillFormAction: ActionFn = async (tabId, params, options) => {
         tabId,
         { action: "form.fill", label, context },
         apiKey,
+        llmProvider,
       );
       if (resolved) {
         try {
@@ -207,6 +330,9 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
   const selector = params?.selector;
   const label = params?.label;
   const checked = params?.checked;
+  const context = params?.context;
+  /** true면 목표 checked 비교 없이 한 번만 클릭(실제 사용자 클릭과 동일한 토글) */
+  const clickOnly = params?.clickOnly === true;
 
   if (options?.validationOnly) {
     if (selector) {
@@ -218,7 +344,10 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
     return;
   }
 
-  if (selector) {
+  const hasDynamicSelector =
+    typeof selector === "string" && /_uid_|uid_/i.test(selector);
+
+  if (selector && !hasDynamicSelector) {
     try {
       await cdp.evaluate(
         tabId,
@@ -226,8 +355,9 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
           ${CHECK_CLICK_SCRIPT}
           var el = document.querySelector(${JSON.stringify(selector)});
           if (!el) throw new Error('Element not found: ' + ${JSON.stringify(selector)});
+          var clickOnly = ${JSON.stringify(clickOnly)};
           var wantChecked = ${JSON.stringify(checked)};
-          if (wantChecked !== null && wantChecked !== undefined && el.checked !== undefined && el.checked === wantChecked) return;
+          if (!clickOnly && wantChecked !== null && wantChecked !== undefined && el.checked !== undefined && el.checked === wantChecked) return;
           fluxCheckClick(el);
         })()`,
       );
@@ -244,28 +374,69 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
         ${CHECK_CLICK_SCRIPT}
         var allCheckables = document.querySelectorAll('input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]');
         var norm = function(s) { return (s || '').trim().replace(/\\s+/g, ' ').toLowerCase(); };
-        var target = ${JSON.stringify(label.trim().toLowerCase())};
+        var key = function(s) { return norm(s).replace(/\\s+/g, '').replace(/[\\u207A⁺]/g, '+'); };
+        var target = key(${JSON.stringify(label || "")});
+        var contextKey = key(${JSON.stringify(context || "")});
+        var clickOnly = ${JSON.stringify(clickOnly)};
         var wantChecked = ${JSON.stringify(checked)};
 
+        function getCandidateText(cb, lbl) {
+          var parts = [];
+          if (lbl) {
+            parts.push(lbl.textContent || '');
+            var img = lbl.querySelector('img[alt]');
+            if (img && img.getAttribute('alt')) parts.push(img.getAttribute('alt'));
+          }
+          var wrap = cb.closest('[data-gtm-event-label], [data-gtm-click-text], [data-gtm-click-location], .c-checkbox, .c-card-box');
+          var src = wrap || cb;
+          if (src && src.getAttribute) {
+            parts.push(src.getAttribute('data-gtm-event-label') || '');
+            parts.push(src.getAttribute('data-gtm-click-text') || '');
+            parts.push(src.getAttribute('data-gtm-click-location') || '');
+          }
+          return key(parts.join(' '));
+        }
+
+        function getContextText(cb) {
+          var parent = cb.closest('li, article, section, dl, .card, [class*="card"], [class*="product"], [class*="priceplan"], [role="dialog"], .modal, [class*="modal"], nav, header') || cb.parentElement;
+          return key(parent ? (parent.textContent || '') : '');
+        }
+
+        var best = null;
+        var bestScore = -1;
         for (var i = 0; i < allCheckables.length; i++) {
           var cb = allCheckables[i];
           var id = cb.id || '';
           var lbl = id ? document.querySelector('label[for="' + id.replace(/"/g, '\\\\"') + '"]') : cb.closest('label');
-          if (!lbl) continue;
-          var lblText = norm(lbl.textContent);
-          if (lblText.indexOf(target) < 0 && target.indexOf(lblText) < 0) continue;
-          if (wantChecked !== null && wantChecked !== undefined && cb.checked !== undefined && cb.checked === wantChecked) return;
-          fluxCheckClick(cb);
+          var candidateKey = getCandidateText(cb, lbl);
+          if (!candidateKey) continue;
+          var textMatch = candidateKey.indexOf(target) >= 0 || target.indexOf(candidateKey) >= 0;
+          if (!textMatch) continue;
+          var score = 100;
+          if (contextKey) {
+            var ctx = getContextText(cb);
+            if (ctx.indexOf(contextKey) >= 0) score += 60;
+          }
+          if (score > bestScore) {
+            best = cb;
+            bestScore = score;
+          }
+        }
+
+        if (best) {
+          if (!clickOnly && wantChecked !== null && wantChecked !== undefined && best.checked !== undefined && best.checked === wantChecked) return;
+          fluxCheckClick(best);
           return;
         }
 
         var labels = document.querySelectorAll('label');
         for (var j = 0; j < labels.length; j++) {
-          if (norm(labels[j].textContent).indexOf(target) < 0) continue;
+          var labelText = (labels[j].textContent || '') + ' ' + ((labels[j].querySelector('img[alt]') && labels[j].querySelector('img[alt]').getAttribute('alt')) || '');
+          if (key(labelText).indexOf(target) < 0) continue;
           var inp = labels[j].querySelector('input[type="checkbox"], input[type="radio"]') ||
                     (labels[j].getAttribute('for') ? document.getElementById(labels[j].getAttribute('for')) : null);
           if (inp) {
-            if (wantChecked !== null && wantChecked !== undefined && inp.checked !== undefined && inp.checked === wantChecked) return;
+            if (!clickOnly && wantChecked !== null && wantChecked !== undefined && inp.checked !== undefined && inp.checked === wantChecked) return;
             fluxCheckClick(inp);
             return;
           }

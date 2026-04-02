@@ -13,6 +13,9 @@ export interface RunnerState {
   totalSteps: number;
   stepResults: StepResult[];
   error?: string;
+  /** 체인 실행 시 1부터 (전체 체인 길이는 chainTotal) */
+  chainPart?: number;
+  chainTotal?: number;
 }
 
 export interface PageDomCapturePayload {
@@ -46,6 +49,11 @@ export interface RunScenarioOptions {
   stepDelayMs?: number;
   validationOnly?: boolean;
   apiKey?: string;
+  llmProvider?: string;
+  /** 이 인덱스부터 실행을 시작합니다. 이전 스텝은 skipped 처리됩니다. */
+  startFromIndex?: number;
+  /** true면 첫 스텝이 nav.goto일 때 생략 (이전 시나리오 종료 후 같은 URL에서 이어 실행) */
+  skipLeadingNavGoto?: boolean;
   /** 시나리오 실행 중 방문하는 각 페이지 DOM을 캡처할 때 호출됩니다. */
   onPageDomCaptured?: (payload: PageDomCapturePayload) => void;
 }
@@ -73,16 +81,25 @@ async function captureCurrentPageDom(
 const NEW_TAB_WAIT_MS = 5000;
 const NEW_TAB_POLL_MS = 200;
 
+/** 단일 시나리오 실행. 성공 완료 시 true, 실패/중단 시 false */
 export async function runScenario(
   tabId: number,
   scenario: Scenario,
   onStatus: StatusCallback,
   options?: RunScenarioOptions,
-): Promise<void> {
+): Promise<boolean> {
   abortController = new AbortController();
   isPaused = false;
   const results: StepResult[] = [];
   const stepDelayMs = options?.stepDelayMs ?? DEFAULT_STEP_DELAY_MS;
+  let startFromIndex = options?.startFromIndex ?? 0;
+  if (
+    options?.skipLeadingNavGoto &&
+    scenario.steps[0]?.actionId === "nav.goto" &&
+    startFromIndex === 0
+  ) {
+    startFromIndex = 1;
+  }
   const onPageDomCaptured = options?.onPageDomCaptured;
 
   let currentTabId = tabId;
@@ -151,7 +168,11 @@ export async function runScenario(
       await captureCurrentPageDom(currentTabId, onPageDomCaptured);
     }
 
-    for (let i = 0; i < scenario.steps.length; i++) {
+    for (let i = 0; i < startFromIndex && i < scenario.steps.length; i++) {
+      results.push({ action: scenario.steps[i].actionId, status: "skipped" });
+    }
+
+    for (let i = startFromIndex; i < scenario.steps.length; i++) {
       if (abortController.signal.aborted) break;
 
       while (isPaused && !abortController.signal.aborted) {
@@ -163,17 +184,21 @@ export async function runScenario(
       const step = scenario.steps[i];
       onStatus(buildState(scenario, "running", i, results));
 
+      await cdp.waitForPageReady(currentTabId);
+
       const result = await executeAction(currentTabId, step.actionId, step.params, {
         validationOnly: options?.validationOnly,
         apiKey: options?.apiKey,
+        llmProvider: options?.llmProvider,
       });
       results.push(result);
 
       if (result.status === "failed") {
         onStatus(buildState(scenario, "error", i, results, result.error));
-        return;
+        return false;
       }
 
+      await cdp.waitForPageReady(currentTabId);
       await sleep(stepDelayMs);
 
       await switchToNewTabIfNeeded();
@@ -185,13 +210,16 @@ export async function runScenario(
 
     if (!abortController?.signal.aborted) {
       onStatus(buildState(scenario, "done", scenario.steps.length - 1, results));
+      return true;
     }
+    return false;
   } catch (err: any) {
     const message =
       err?.message?.includes("document is not defined")
         ? "이 탭에서는 시나리오를 실행할 수 없습니다. 일반 웹페이지(예: https://...) 탭을 검사한 상태에서 실행해주세요."
         : err?.message ?? String(err);
     onStatus(buildState(scenario, "error", results.length, results, message));
+    return false;
   } finally {
     chrome.tabs.onCreated.removeListener(onTabCreated);
     await cdp.detachFromTab(originalTabId).catch(() => {});
@@ -199,6 +227,35 @@ export async function runScenario(
       await cdp.detachFromTab(tid).catch(() => {});
     }
     abortController = null;
+  }
+}
+
+/** 여러 시나리오를 순서대로 실행. 2번째부터는 첫 nav.goto 생략(같은 탭 이어가기). */
+export async function runScenarioChain(
+  tabId: number,
+  scenarios: Scenario[],
+  onStatus: (state: RunnerState) => void,
+  options?: RunScenarioOptions,
+): Promise<void> {
+  if (scenarios.length === 0) return;
+  const chainTotal = scenarios.length;
+  const userStart = options?.startFromIndex ?? 0;
+  for (let part = 0; part < scenarios.length; part++) {
+    const sc = scenarios[part];
+    const skipNav = part > 0;
+    const startFromIndex = part === 0 ? userStart : 0;
+    const ok = await runScenario(tabId, sc, (state) => {
+      onStatus({
+        ...state,
+        chainPart: part + 1,
+        chainTotal,
+      });
+    }, {
+      ...options,
+      startFromIndex,
+      skipLeadingNavGoto: skipNav,
+    });
+    if (!ok) return;
   }
 }
 

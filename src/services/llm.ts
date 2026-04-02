@@ -1,7 +1,9 @@
 import { ACTION_REGISTRY, type ActionDefinition } from "@/app/data";
+import { getLlmProvider, LLM_PROVIDER_OPTIONS } from "@/stores/settingsStore";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
-const MODEL = "gpt-4o-mini";
+const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API_VERSION = "2023-06-01";
 
 function buildActionCatalog(): string {
   const implemented = Object.values(ACTION_REGISTRY).filter(
@@ -39,12 +41,30 @@ DRR 문서는 보통 다음 구조를 가집니다.
 4. **경로** — 실제 시연 흐름. ">" 또는 "완료 후"/"이후"로 구분된 단계들 → steps.
 5. **기대결과** — 시연 후 확인할 것 → assertions.
 
+### 「[○○] 화면」·Confluence DRR 표현 (매우 중요)
+
+- DRR에 **「[즐겨찾기 메뉴 설정] 화면」**처럼 대괄호 화면명이 나오면, 그것이 **앱 상단 타이틀 문구와 같다고 가정하지 말 것.** 보통 **이전 경로에서 특정 버튼을 눌렀을 때 열리는 화면**을 가리킨다.
+- **button.click**에는 반드시 **DOM/ctas에 있는 실제 버튼 텍스트**만 넣는다. 화면명을 버튼 text로 쓰지 말 것.
+- 예: 「즐겨찾기 메뉴 설정 화면」= 메인의 즐겨찾기 영역에서 **「설정하러 가기」** 또는 **「메뉴 설정」** 클릭 후 진입하는 화면 → 진입 step은 해당 button.click 한 개로 처리.
+- **Confluence에서 붙여넣은 원문**이면, 위 대응 관계를 **drrClarification**에 한 줄로 요약해 넣는다 (사용자가 시나리오 설명으로 확인할 수 있게).
+
+### 스크롤 동작 확인 (DRR에 반드시 steps로 반영)
+
+- DRR에 **「좌우 스크롤」「1depth 탭 가로 스크롤」「가로 스크롤 동작」** 등이 있으면, 해당 화면(탭/설정 화면) 진입 **직후** steps에 **scroll.by**를 넣는다.
+  - 예: \`{ "action": "scroll.by", "params": { "deltaX": 180, "deltaY": 0 }, "desc": "1depth 탭 영역 좌우 스크롤" }\` 를 **2~3회** 연속 (양방향이면 deltaX 양수 후 음수 -180).
+  - 각 scroll.by 뒤에 **nav.wait** ms=400~600 권장.
+- DRR에 **「상하 스크롤」「전체 화면 세로 스크롤」** 등이 있으면 **scroll.by**로 아래로 이동:
+  - 예: \`scroll.by\` deltaY=350, deltaX=0 → nav.wait 500 → scroll.by deltaY=350 → nav.wait → **scroll.to** y=0 또는 scroll.by deltaY=-700 으로 위로 복귀(고정 UI 확인 맥락).
+- **「상·하단 버튼 영역 고정」**은 DOM assertion으로 완전 검증 어려움 → assertions 생략 가능. **스크롤 재현 steps는 반드시 포함** (시연 자동화 목적).
+- **scroll.to**: 절대 위치(y) 이동. **scroll.by**: 상대 이동(deltaX, deltaY). 가로만 스크롤할 때 selector 생략 가능(엔진이 가로 스크롤 가능한 영역 탐색).
+
 ---
 
 Output ONLY valid JSON:
 {
   "name": "string — scenario title",
   "baseUrl": "string — host only (no scheme/path). Use the 'current page host' when provided; never use 'example.com' unless the DRR explicitly mentions it. If no domain is specified, use empty string.",
+  "drrClarification": "string (optional) — 한 줄. DRR/Confluence 문서에 나온 「화면명」과 실제 앱 버튼의 대응을 명시. 예: 문서의 「즐겨찾기 메뉴 설정」화면 = 메인 즐겨찾기에서 「설정하러 가기」 또는 「메뉴 설정」클릭 후 진입. 문서가 애매할 때만 채운다.",
   "steps": [{ "action": "string", "params": { ... }, "desc": "string (Korean)" }],
   "assertions": [{ "action": "string", "params": { ... }, "desc": "string (Korean)" }]
 }
@@ -54,11 +74,14 @@ Output ONLY valid JSON:
 ${buildActionCatalog()}
 
 ### 액션 선택 가이드
-- 가장 구체적인 액션 ID를 사용할 것: form.fill보다 form.input_text, form.check보다 form.checkbox_check.
+- **스크롤 검증 DRR** → scroll.by + nav.wait 조합을 빠뜨리지 말 것.
+- 가장 구체적인 액션 ID를 사용할 것: form.fill보다 form.input_text.
+- **체크/라디오:** form.check에 clickOnly: true와 label(+context) — 실제 클릭 한 번(토글). DRR에 선택/해제를 정확히 구분해야 할 때만 checked를 쓰고, 그 외에는 clickOnly만.
 - keyboard.enter/escape/tab이 있으면 keyboard.press 대신 사용.
 - assert.element_visible/element_hidden이 있으면 assert.visible/hidden 대신 사용.
 - button.click의 text는 **ctas에 나온 버튼 텍스트 그대로** 사용. 상품명+버튼명을 합치지 말 것(예: "아이폰 17Pro 신청하기" -> text="신청하기", context로 구분).
 - form.input_text/form.fill의 label은 필수.
+- **본인인증·주민번호·휴대폰 등 연속 입력:** formFields에 나온 label/placeholder/aria-label을 **필드마다 다르게** 써서 한 필드에만 매칭되게 할 것. 같은 문구가 반복되면 params.context에 해당 입력 블록(예: 본인인증 모달, 이름/생년월일 행)을 넣고, DOM 요약의 구분 텍스트를 label에 반영.
 
 ## DOM 요약 활용법 (페이지 요약이 있으면 반드시 준수)
 
@@ -108,6 +131,8 @@ export interface DSLStep {
 export interface DSL {
   name: string;
   baseUrl: string;
+  /** DRR 화면명 ↔ 실제 버튼 대응 한 줄 (저장 시 시나리오 설명에 반영) */
+  drrClarification?: string;
   steps: DSLStep[];
   assertions: DSLStep[];
 }
@@ -288,13 +313,25 @@ function extractDomainToken(drrText: string): string | null {
   return null;
 }
 
+const MAX_PAGE_SUMMARY_CHARS = 200_000;
+
+function truncatePageSummary(summary: string): string {
+  if (summary.length <= MAX_PAGE_SUMMARY_CHARS) return summary;
+  const truncated = summary.slice(0, MAX_PAGE_SUMMARY_CHARS);
+  const lastPageBreak = truncated.lastIndexOf("\n## Page ");
+  const cutPoint = lastPageBreak > 0 ? lastPageBreak : MAX_PAGE_SUMMARY_CHARS;
+  return truncated.slice(0, cutPoint) + "\n\n(... 이하 페이지 요약 생략 — 토큰 제한)";
+}
+
 export async function generateDSL(
   drrText: string,
   apiKey: string,
   options?: { pageSummary?: string | null; currentHost?: string | null },
 ): Promise<DSL> {
-  let userContent = options?.pageSummary?.trim()
-    ? `페이지 요약 (시나리오 흐름 순서대로 캡처된 페이지들):\n\n${options.pageSummary}\n\n---\n\nDRR to convert:\n${drrText}`
+  const rawSummary = options?.pageSummary?.trim() || "";
+  const safeSummary = rawSummary ? truncatePageSummary(rawSummary) : "";
+  let userContent = safeSummary
+    ? `페이지 요약 (시나리오 흐름 순서대로 캡처된 페이지들):\n\n${safeSummary}\n\n---\n\nDRR to convert:\n${drrText}`
     : drrText;
   if (options?.currentHost?.trim()) {
     userContent += `\n\n[현재 페이지 호스트 (baseUrl에 사용할 값, DRR에 도메인이 없으면 반드시 이 값을 쓸 것)]: ${options.currentHost.trim()}`;
@@ -304,36 +341,72 @@ export async function generateDSL(
     userContent += `\n\n${tokenHint}`;
   }
 
-  const response = await fetch(OPENAI_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-    }),
-  });
+  const provider = getLlmProvider();
+  const providerConfig = LLM_PROVIDER_OPTIONS.find((o) => o.value === provider) ?? LLM_PROVIDER_OPTIONS[0];
+  const model = providerConfig.model;
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`OpenAI API error (${response.status}): ${errorBody}`);
+  let content: string;
+
+  if (provider === "anthropic") {
+    const response = await fetch(ANTHROPIC_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": ANTHROPIC_API_VERSION,
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT,
+        messages: [
+          { role: "user", content: userContent },
+        ],
+        temperature: 0.2,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`Anthropic API error (${response.status}): ${errorBody}`);
+    }
+
+    const data = await response.json();
+    content = data.content?.[0]?.text ?? "";
+  } else {
+    const response = await fetch(OPENAI_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userContent },
+        ],
+        temperature: 0.2,
+        response_format: { type: "json_object" },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`OpenAI API error (${response.status}): ${errorBody}`);
+    }
+
+    const data = await response.json();
+    content = data.choices?.[0]?.message?.content ?? "";
   }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
 
   if (!content) {
-    throw new Error("OpenAI API returned empty content");
+    throw new Error("LLM API returned empty content");
   }
 
-  const parsed: DSL = JSON.parse(content);
+  const cleanedContent = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+  const parsed: DSL = JSON.parse(cleanedContent);
 
   if (!parsed.name || !Array.isArray(parsed.steps)) {
     throw new Error("Invalid DSL structure returned from LLM");

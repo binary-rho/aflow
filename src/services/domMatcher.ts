@@ -11,15 +11,24 @@ import {
   formatPageSummaryForLLM,
   type PageSummaryPayload,
 } from "@/services/domSnapshot";
+import {
+  getLlmProvider,
+  getApiKeyForProvider,
+} from "@/stores/settingsStore";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
-const MODEL = "gpt-4o-mini";
+const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API_VERSION = "2023-06-01";
+
+const OPENAI_MATCHER_MODEL = "gpt-4o";
+const ANTHROPIC_MATCHER_MODEL = "claude-sonnet-4-6";
 
 export interface ElementIntent {
   action: "button.click" | "form.fill";
   text?: string;
   label?: string;
   context?: string;
+  gtmText?: string;
 }
 
 export interface ResolvedElement {
@@ -31,9 +40,9 @@ const MATCHER_PROMPT = `You are a DOM element matcher.
 Given a page's DOM summary and an intent, return the CSS selector of the matching element.
 
 Rules:
-- For button clicks: look at the "ctas" list. Each CTA shows: text, role, context (in ...), and selector (→).
+- For button clicks: look at the "ctas" list. Each CTA shows: text, role, context (in ...), gtm (gtm "..."), and selector (→).
 - For form fills: look at the "formFields" list. Each field shows: label, type, context, and selector (→).
-- Match by text/label first. If multiple items share the same text, use context to disambiguate.
+- Match by text/label first. If multiple items share the same text, use context and gtm attributes to disambiguate.
 - Return ONLY the selector string (the value after →). No quotes, no explanation, no JSON.
 - If no match is found, return exactly: NOT_FOUND`;
 
@@ -66,8 +75,8 @@ function textMatches(itemText: string | null, searchText: string): boolean {
   const a = normalizeForMatch(itemText);
   const b = normalizeForMatch(searchText);
   if (a === b) return true;
-  const lengthGap = Math.abs(a.length - b.length);
-  if (lengthGap > 2) return false;
+  const shorter = a.length <= b.length ? a : b;
+  if (shorter.length < 3) return false;
   return a.includes(b) || b.includes(a);
 }
 
@@ -104,12 +113,25 @@ function tryFastPath(
     const matches = (summary.ctas || []).filter(
       (c) => c.selector && textMatches(c.text, intent.text!),
     );
+    console.log(`[flux] tryFastPath: ${matches.length} text matches for "${intent.text}"`);
+    if (matches.length > 1) {
+      console.log("[flux] tryFastPath contexts:", matches.map((c) => c.context).join(" | "));
+    }
     if (matches.length === 1) return matches[0].selector!;
-    if (matches.length > 1 && intent.context) {
-      const narrowed = matches.filter((c) =>
-        contextMatches(c.context, intent.context!),
-      );
-      if (narrowed.length === 1) return narrowed[0].selector!;
+    if (matches.length > 1) {
+      if (intent.context) {
+        const narrowed = matches.filter((c) =>
+          contextMatches(c.context, intent.context!),
+        );
+        console.log(`[flux] tryFastPath: context="${intent.context}" → ${narrowed.length} narrowed`);
+        if (narrowed.length === 1) return narrowed[0].selector!;
+      }
+      if (intent.gtmText) {
+        const byGtm = matches.filter(
+          (c) => c.gtmText && textMatches(c.gtmText, intent.gtmText!),
+        );
+        if (byGtm.length === 1) return byGtm[0].selector!;
+      }
     }
   }
 
@@ -137,37 +159,74 @@ async function callMatcherLLM(
   summary: PageSummaryPayload,
   intent: ElementIntent,
   apiKey: string,
+  providerOverride?: string,
 ): Promise<string | null> {
   const domText = formatPageSummaryForLLM(summary);
+  const contextPart = intent.context ? ` in context "${intent.context}"` : "";
+  const gtmPart = intent.gtmText ? ` (gtm-click-text: "${intent.gtmText}")` : "";
   const intentDesc =
     intent.action === "button.click"
-      ? `Click button with text "${intent.text}"${intent.context ? ` in context "${intent.context}"` : ""}`
-      : `Fill form field with label "${intent.label}"${intent.context ? ` in context "${intent.context}"` : ""}`;
+      ? `Click button with text "${intent.text}"${contextPart}${gtmPart}`
+      : `Fill form field with label "${intent.label}"${contextPart}${gtmPart}`;
 
-  const response = await fetch(OPENAI_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: "system", content: MATCHER_PROMPT },
-        {
-          role: "user",
-          content: `## Page DOM:\n${domText}\n\n## Intent:\n${intentDesc}`,
-        },
-      ],
-      temperature: 0,
-      max_tokens: 200,
-    }),
-  });
+  const userMessage = `## Page DOM:\n${domText}\n\n## Intent:\n${intentDesc}`;
+  const provider = providerOverride || getLlmProvider();
 
-  if (!response.ok) return null;
+  let content: string;
 
-  const data = await response.json();
-  const content = (data.choices?.[0]?.message?.content ?? "").trim();
+  if (provider === "anthropic") {
+    const anthropicKey = apiKey || getApiKeyForProvider("anthropic") || "";
+    const response = await fetch(ANTHROPIC_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": anthropicKey,
+        "anthropic-version": ANTHROPIC_API_VERSION,
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MATCHER_MODEL,
+        max_tokens: 200,
+        system: MATCHER_PROMPT,
+        messages: [{ role: "user", content: userMessage }],
+        temperature: 0,
+      }),
+    });
+
+    if (!response.ok) {
+      console.warn(`[flux] Anthropic matcher API error: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    content = (data.content?.[0]?.text ?? "").trim();
+  } else {
+    const response = await fetch(OPENAI_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_MATCHER_MODEL,
+        messages: [
+          { role: "system", content: MATCHER_PROMPT },
+          { role: "user", content: userMessage },
+        ],
+        temperature: 0,
+        max_tokens: 200,
+      }),
+    });
+
+    if (!response.ok) {
+      console.warn(`[flux] OpenAI matcher API error: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    content = (data.choices?.[0]?.message?.content ?? "").trim();
+  }
+
   if (!content || content === "NOT_FOUND") return null;
   return content;
 }
@@ -183,6 +242,7 @@ export async function resolveElement(
   tabId: number,
   intent: ElementIntent,
   apiKey: string,
+  llmProvider?: string,
 ): Promise<ResolvedElement | null> {
   const summary = await captureLiveDom(tabId);
   if (!summary) return null;
@@ -193,8 +253,11 @@ export async function resolveElement(
     return { selector: fastResult, matchedBy };
   }
 
-  if (!apiKey) return null;
-  const llmResult = await callMatcherLLM(summary, intent, apiKey);
+  const provider = llmProvider || getLlmProvider();
+  const effectiveKey = apiKey || getApiKeyForProvider(provider as any) || "";
+  if (!effectiveKey) return null;
+
+  const llmResult = await callMatcherLLM(summary, intent, effectiveKey, provider);
   if (llmResult) {
     return { selector: llmResult, matchedBy: "llm" };
   }
