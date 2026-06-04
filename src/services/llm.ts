@@ -82,6 +82,9 @@ ${buildActionCatalog()}
 - button.click의 text는 **ctas에 나온 버튼 텍스트 그대로** 사용. 상품명+버튼명을 합치지 말 것(예: "아이폰 17Pro 신청하기" -> text="신청하기", context로 구분).
 - form.input_text/form.fill의 label은 필수.
 - **본인인증·주민번호·휴대폰 등 연속 입력:** formFields에 나온 label/placeholder/aria-label을 **필드마다 다르게** 써서 한 필드에만 매칭되게 할 것. 같은 문구가 반복되면 params.context에 해당 입력 블록(예: 본인인증 모달, 이름/생년월일 행)을 넣고, DOM 요약의 구분 텍스트를 label에 반영.
+- **네이티브 select (드롭다운):** formFields에 inputType이 "select-one"이고 options가 있으면 **반드시 form.select**를 사용. button.click으로 대체하지 말 것. params에 label(formFields의 label)과 optionText(선택할 옵션 텍스트)를 넣는다. 옵션 선택 후 "선택" 버튼이 있으면 form.select → button.click 순서로 생성.
+- **커스텀 드롭다운:** formFields에 inputType이 "custom-select"이면 **form.select_dropdown**을 사용. div/button 기반 드롭다운(role="combobox", aria-haspopup 등)에 해당. params에 label(트리거의 레이블)과 optionText(선택할 옵션 텍스트)를 넣는다. context는 같은 label의 드롭다운이 여러 개일 때만 사용.
+- **inputType 구분:** "select-one" → form.select (네이티브). "custom-select" → form.select_dropdown (커스텀). 둘을 혼동하지 말 것.
 
 ## DOM 요약 활용법 (페이지 요약이 있으면 반드시 준수)
 

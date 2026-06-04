@@ -54,7 +54,8 @@ function toHost(url: string): string {
 
 function toPath(url: string): string {
   try {
-    return new URL(url).pathname || "/";
+    const parsed = new URL(url);
+    return `${parsed.pathname || "/"}${parsed.search}${parsed.hash}`;
   } catch {
     return "/";
   }
@@ -381,7 +382,15 @@ chrome.runtime.onMessage.addListener(
       case "STOP_RECORDING": {
         stopRecording(message.tabId)
           .then((result) => {
+            console.log("[flux recording] total logs:", result.logs?.length ?? 0);
+            (result.logs || []).forEach((log, i) => {
+              console.log(`[flux recording] log[${i}] ${log.type}:`, JSON.stringify(log).slice(0, 200));
+            });
             const scenario = buildScenarioFromRecorded(result.startUrl || "", result.logs || []);
+            console.log("[flux recording] built scenario steps:", scenario.steps.length);
+            scenario.steps.forEach((s, i) => {
+              console.log(`[flux recording] step[${i}] ${s.actionId}:`, JSON.stringify(s.params).slice(0, 150));
+            });
             sendResponse({
               ok: true,
               scenario,

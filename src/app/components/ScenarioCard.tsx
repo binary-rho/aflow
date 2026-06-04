@@ -49,11 +49,12 @@ export function ScenarioCard({
     return pathOnly;
   })();
   const pathStr = startingPath != null ? String(startingPath).trim() : "";
-  const hasPathStart = pathStr.length > 0;
+  const displayPathStr = pathStr.replace(/[?#].*$/, "");
+  const hasPathStart = displayPathStr.length > 0;
   const displayUrl = hasPathStart
-    ? pathStr.startsWith("/")
-      ? pathStr
-      : `/${pathStr}`
+    ? displayPathStr.startsWith("/")
+      ? displayPathStr
+      : `/${displayPathStr}`
     : hostForHint;
   const displayTitle = hasPathStart
     ? `${hostForHint.replace(/\/$/, "")}${displayUrl}`
