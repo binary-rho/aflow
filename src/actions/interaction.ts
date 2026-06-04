@@ -1,124 +1,40 @@
 import * as cdp from "@/engine/cdp";
-import { resolveElement } from "@/services/domMatcher";
+import {
+  resolveAndClick,
+  resolveAndHover,
+  resolveAndFill,
+  isDynamicSelector,
+  isBrittleSelector,
+  withScrollRetry,
+} from "@/services/targetResolver";
 import type { ActionFn } from "./index";
 
-const CLICKABLE_BY_TEXT_SELECTOR = "button, a, [role='button'], [role='link']";
-
-const isDynamicSelector = (s: string | undefined | null): boolean =>
-  !!s && /_uid_|^#[\w-]*uid[\w-]*\d|\[name=["']?_[^"']*uid/i.test(s);
-
-const MAX_SCROLL_RETRIES = 6;
-
-/**
- * 클릭 함수가 "not found" 에러로 실패하면 페이지를 스크롤 다운하며 재시도.
- * lazy render로 뷰포트 밖 요소가 아직 DOM에 없는 경우를 대응.
- */
-async function withScrollRetry(
-  tabId: number,
-  fn: () => Promise<void>,
-): Promise<void> {
-  for (let attempt = 0; attempt <= MAX_SCROLL_RETRIES; attempt++) {
-    try {
-      await fn();
-      return;
-    } catch (err: any) {
-      const isNotFound =
-        err?.message?.includes("not found") ||
-        err?.message?.includes("찾을 수 없");
-      if (!isNotFound || attempt === MAX_SCROLL_RETRIES) throw err;
-      const atBottom = await cdp.isAtPageBottom(tabId);
-      if (atBottom) throw err;
-      console.log(`[flux] element not found, scrolling down (attempt ${attempt + 1}/${MAX_SCROLL_RETRIES})`);
-      await cdp.scrollDownByViewport(tabId);
-    }
-  }
-}
-
 export const clickButtonAction: ActionFn = async (tabId, params, options) => {
-  const skipClick = options?.validationOnly;
-  let selector = params?.selector;
-  const text = params?.text;
-  const context = params?.context;
-  const apiKey = options?.apiKey;
-  const llmProvider = options?.llmProvider;
-
-  if (isDynamicSelector(selector)) selector = undefined;
-
-  if (selector) {
-    let selectorWorked = false;
-    try {
-      let selectorValid = true;
-      if (text || context) {
-        selectorValid = await cdp.evaluate(
-          tabId,
-          `(() => {
-            const selector = ${JSON.stringify(selector)};
-            const expectedText = ${JSON.stringify(text || "")};
-            const expectedContext = ${JSON.stringify(context || "")};
-            const norm = (s) => (s || "").trim().replace(/\\s+/g, " ");
-            const key = (s) => norm(s).replace(/\\s+/g, "").replace(/[\\u207A\\u2B]/g, "+").toLowerCase();
-            const el = document.querySelector(selector);
-            if (!el) return false;
-            const elKey = key((el.innerText || el.textContent || "").trim());
-            const textKey = key(expectedText);
-            const isTextMatched = !textKey || elKey === textKey || elKey.includes(textKey) || textKey.includes(elKey);
-            return isTextMatched;
-          })()`,
-        );
-      }
-      if (selectorValid) {
-        await cdp.click(tabId, selector, { skipClick });
-        selectorWorked = true;
-      }
-    } catch {
-      console.warn(`[flux] selector failed: "${selector}"`);
-    }
-    if (selectorWorked) return;
-    if (!text) throw new Error(`Element not found by selector "${selector}" and no text fallback`);
-    console.log(`[flux] selector invalid, falling through to text matching: "${text}"`);
-  }
-
-  if (text) {
-    console.log(`[flux] button.click: text="${text}", context="${context ?? "(none)"}"`);
-    if (apiKey) {
-      const resolved = await resolveElement(
-        tabId,
-        { action: "button.click", text, context },
-        apiKey,
-        llmProvider,
-      );
-      if (resolved) {
-        console.log(`[flux] resolveElement → ${resolved.matchedBy}: "${resolved.selector}"`);
-        try {
-          await cdp.click(tabId, resolved.selector, { skipClick });
-          return;
-        } catch (err: any) {
-          console.warn(`[flux] resolved selector click failed: ${err?.message}`);
-        }
-      } else {
-        console.log("[flux] resolveElement → no match");
-      }
-    }
-    if (context) {
-      try {
-        console.log("[flux] fallback → clickByTextWithContext");
-        await withScrollRetry(tabId, () =>
-          cdp.clickByTextWithContext(tabId, text, context, CLICKABLE_BY_TEXT_SELECTOR, {
-            skipClick,
-          }),
-        );
-        return;
-      } catch (err: any) {
-        console.warn(`[flux] clickByTextWithContext failed: ${err?.message}`);
-      }
-    }
-    console.log("[flux] final fallback → clickByText (no context, picks topmost)");
-    await withScrollRetry(tabId, () =>
-      cdp.clickByText(tabId, text, CLICKABLE_BY_TEXT_SELECTOR, { skipClick }),
-    );
-  } else {
+  if (!params?.text && !params?.selector) {
     throw new Error("button.click requires 'text' or 'selector' param");
   }
+  const result = await resolveAndClick(
+    tabId,
+    {
+      selector: params?.selector,
+      text: params?.text,
+      context: params?.context,
+    },
+    {
+      skipClick: options?.validationOnly,
+      apiKey: options?.apiKey,
+      llmProvider: options?.llmProvider,
+    },
+  );
+  if (result.status !== "resolved") {
+    throw new Error(result.reason);
+  }
+  return {
+    strategy: result.strategy,
+    selector: result.selector,
+    ambiguous: result.ambiguous,
+    candidates: result.candidates,
+  };
 };
 
 /** GNB(헤더/네비)에 있는 로그인 버튼만 클릭. 경로에 "GNB > 로그인"일 때 사용. */
@@ -126,95 +42,41 @@ export const gnbClickLoginAction: ActionFn = async (tabId, _params, options) => 
   await cdp.clickLoginInGNB(tabId, { skipClick: options?.validationOnly });
 };
 
-const HOVERABLE_SELECTOR = 'nav a, nav button, [role="menuitem"], [class*="menu"] a, [class*="menu"] button, [class*="gnb"] a, [class*="gnb"] button, [role="tab"], header a, header button, a, button, [role="button"]';
-
 export const hoverAction: ActionFn = async (tabId, params, options) => {
-  const selector = isDynamicSelector(params?.selector) ? undefined : params?.selector;
-  const text = params?.text;
-  const context = params?.context;
-  const apiKey = options?.apiKey;
-  const llmProvider = options?.llmProvider;
-
-  if (selector) {
-    let selectorWorked = false;
-    try {
-      if (text) {
-        const selectorValid = await cdp.evaluate(
-          tabId,
-          `(() => {
-            const el = document.querySelector(${JSON.stringify(selector)});
-            if (!el) return false;
-            const norm = (s) => (s || '').trim().replace(/\\s+/g, '').replace(/[\\u207A\\u2B]/g, '+').toLowerCase();
-            const elKey = norm(el.innerText || el.textContent || '');
-            const textKey = norm(${JSON.stringify(text)});
-            return !textKey || elKey.includes(textKey) || textKey.includes(elKey);
-          })()`,
-        );
-        if (selectorValid) {
-          await cdp.hover(tabId, selector);
-          selectorWorked = true;
-        }
-      } else {
-        await cdp.hover(tabId, selector);
-        selectorWorked = true;
-      }
-    } catch {
-      console.warn(`[flux] hover selector failed: "${selector}"`);
-    }
-    if (selectorWorked) return;
-    if (!text) throw new Error(`Hover target not found by selector "${selector}" and no text fallback`);
-    console.log(`[flux] hover selector invalid, falling through to text matching: "${text}"`);
-  }
-
-  if (text) {
-    console.log(`[flux] interaction.hover: text="${text}", context="${context ?? "(none)"}"`);
-
-    if (apiKey) {
-      const resolved = await resolveElement(
-        tabId,
-        { action: "button.click", text, context },
-        apiKey,
-        llmProvider,
-      );
-      if (resolved) {
-        console.log(`[flux] hover resolveElement → ${resolved.matchedBy}: "${resolved.selector}"`);
-        try {
-          await cdp.hover(tabId, resolved.selector);
-          return;
-        } catch (err: any) {
-          console.warn(`[flux] hover resolved selector failed: ${err?.message}`);
-        }
-      }
-    }
-
-    if (context) {
-      try {
-        console.log("[flux] hover fallback → hoverByTextWithContext");
-        await withScrollRetry(tabId, () =>
-          cdp.hoverByTextWithContext(tabId, text, context, HOVERABLE_SELECTOR),
-        );
-        return;
-      } catch (err: any) {
-        console.warn(`[flux] hoverByTextWithContext failed: ${err?.message}`);
-      }
-    }
-
-    console.log("[flux] hover final fallback → hoverByText (no context)");
-    await withScrollRetry(tabId, () =>
-      cdp.hoverByText(tabId, text, HOVERABLE_SELECTOR),
-    );
-  } else {
+  if (!params?.text && !params?.selector) {
     throw new Error("interaction.hover requires 'text' or 'selector' param");
   }
+  const result = await resolveAndHover(
+    tabId,
+    {
+      selector: params?.selector,
+      text: params?.text,
+      context: params?.context,
+    },
+    {
+      apiKey: options?.apiKey,
+      llmProvider: options?.llmProvider,
+    },
+  );
+  if (result.status !== "resolved") {
+    throw new Error(result.reason);
+  }
+  return {
+    strategy: result.strategy,
+    selector: result.selector,
+    ambiguous: result.ambiguous,
+    candidates: result.candidates,
+  };
 };
 
 export const selectOptionAction: ActionFn = async (tabId, params, options) => {
   const selector = isDynamicSelector(params?.selector) ? undefined : params?.selector;
   const label = params?.label;
   const value = params?.value;
+  const optionText = params?.optionText;
 
-  if (!value && !options?.validationOnly) {
-    throw new Error("form.select requires 'value' param");
+  if (!value && !optionText && !options?.validationOnly) {
+    throw new Error("form.select requires 'value' or 'optionText' param");
   }
 
   if (options?.validationOnly) {
@@ -224,7 +86,7 @@ export const selectOptionAction: ActionFn = async (tabId, params, options) => {
         `(() => { if (!document.querySelector(${JSON.stringify(selector)})) throw new Error("Select not found: " + ${JSON.stringify(selector)}); })()`,
       );
     } else if (label) {
-      await cdp.checkFillByLabel(tabId, label);
+      await cdp.checkSelectByLabel(tabId, label);
     } else {
       throw new Error("form.select requires 'selector' or 'label'");
     }
@@ -232,12 +94,194 @@ export const selectOptionAction: ActionFn = async (tabId, params, options) => {
   }
 
   if (selector) {
-    await cdp.selectOption(tabId, selector, value);
+    await cdp.selectOption(tabId, selector, value ?? "", optionText);
   } else if (label) {
-    await cdp.fillByLabel(tabId, label, value);
+    await cdp.selectByLabel(tabId, label, value ?? "", optionText);
   } else {
     throw new Error("form.select requires 'selector' or 'label'");
   }
+};
+
+export const selectDropdownAction: ActionFn = async (tabId, params, options) => {
+  const selector = isDynamicSelector(params?.selector) ? undefined : params?.selector;
+  const label = params?.label;
+  const optionText = params?.optionText;
+  const context = params?.context;
+
+  if (!optionText && !options?.validationOnly) {
+    throw new Error("form.select_dropdown requires 'optionText' param");
+  }
+
+  if (options?.validationOnly) {
+    if (selector) {
+      await cdp.evaluate(
+        tabId,
+        `(() => { if (!document.querySelector(${JSON.stringify(selector)})) throw new Error("Dropdown trigger not found: " + ${JSON.stringify(selector)}); })()`,
+      );
+    } else if (label) {
+      await cdp.evaluate(
+        tabId,
+        `(() => {
+          var norm = function(s) { return (s || '').trim().replace(/\\s+/g, ' ').toLowerCase(); };
+          var target = norm(${JSON.stringify(label)});
+          var triggers = document.querySelectorAll('[role="combobox"], [aria-haspopup="listbox"], [aria-haspopup="true"], [class*="select"] button, [class*="select"] [role="button"], [class*="dropdown"] button, [class*="dropdown"] [role="button"]');
+          for (var i = 0; i < triggers.length; i++) {
+            var el = triggers[i];
+            var ariaLabel = norm(el.getAttribute('aria-label') || '');
+            if (ariaLabel && ariaLabel.includes(target)) return;
+            var id = (el.id || '').trim();
+            if (id) {
+              var lbl = document.querySelector('label[for="' + id.replace(/"/g, '\\\\"') + '"]');
+              if (lbl && norm(lbl.textContent || '').includes(target)) return;
+            }
+            var parentLabel = el.closest('label');
+            if (parentLabel && norm(parentLabel.textContent || '').includes(target)) return;
+            var prev = el.previousElementSibling;
+            if (prev && norm(prev.textContent || '').includes(target)) return;
+            var parent = el.closest('.form-group, .field, [class*="select"], [class*="dropdown"], dt, dd, dl');
+            if (parent && norm(parent.textContent || '').includes(target)) return;
+          }
+          throw new Error('Custom dropdown trigger not found for label: ' + ${JSON.stringify(label)});
+        })()`,
+      );
+    } else {
+      throw new Error("form.select_dropdown requires 'selector' or 'label'");
+    }
+    return;
+  }
+
+  await withScrollRetry(tabId, async () => {
+    await cdp.evaluate(
+      tabId,
+      `(async () => {
+        var norm = function(s) { return (s || '').trim().replace(/\\s+/g, ' ').toLowerCase(); };
+        var key = function(s) { return norm(s).replace(/\\s+/g, ''); };
+        var selectorParam = ${JSON.stringify(selector ?? "")};
+        var labelParam = ${JSON.stringify(label ?? "")};
+        var optionTextParam = ${JSON.stringify(optionText ?? "")};
+        var contextParam = ${JSON.stringify(context ?? "")};
+
+        // Phase 1: Find trigger
+        var trigger = null;
+        if (selectorParam) {
+          trigger = document.querySelector(selectorParam);
+        }
+        if (!trigger && labelParam) {
+          var targetLabel = norm(labelParam);
+          var candidates = document.querySelectorAll(
+            '[role="combobox"], [aria-haspopup="listbox"], [aria-haspopup="true"], ' +
+            'select, ' +
+            '[class*="select"] button, [class*="select"] [role="button"], [class*="select"] > div, ' +
+            '[class*="dropdown"] button, [class*="dropdown"] [role="button"], ' +
+            '[class*="combo"] button, [class*="combo"] [role="button"]'
+          );
+          var best = null;
+          var bestScore = -1;
+          for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            var score = 0;
+            var ariaLabel = norm(el.getAttribute('aria-label') || '');
+            if (ariaLabel && ariaLabel.includes(targetLabel)) score = 100;
+            if (!score) {
+              var id = (el.id || '').trim();
+              if (id) {
+                var lbl = document.querySelector('label[for="' + id.replace(/"/g, '\\\\"') + '"]');
+                if (lbl && norm(lbl.textContent || '').includes(targetLabel)) score = 90;
+              }
+            }
+            if (!score) {
+              var parentLabel = el.closest('label');
+              if (parentLabel && norm(parentLabel.textContent || '').includes(targetLabel)) score = 85;
+            }
+            if (!score) {
+              var prev = el.previousElementSibling;
+              if (prev && norm(prev.textContent || '').includes(targetLabel)) score = 70;
+            }
+            if (!score) {
+              var parent = el.closest('.form-group, .field, [class*="select"], [class*="dropdown"], dt, dd, dl, div');
+              if (parent) {
+                var heading = parent.querySelector('dt, label, [class*="label"], [class*="title"]');
+                if (heading && norm(heading.textContent || '').includes(targetLabel)) score = 60;
+                else if (norm(parent.textContent || '').includes(targetLabel)) score = 40;
+              }
+            }
+            if (score <= 0) continue;
+            if (contextParam) {
+              var ctxParent = el.closest('li, article, section, dl, .card, [class*="card"], [role="dialog"], .modal, [class*="modal"]') || el.parentElement;
+              if (ctxParent && key(ctxParent.textContent || '').includes(key(contextParam))) score += 50;
+            }
+            if (score > bestScore) {
+              best = el;
+              bestScore = score;
+            }
+          }
+          trigger = best;
+        }
+        if (!trigger) throw new Error('Custom dropdown trigger not found: ' + (labelParam || selectorParam));
+
+        // Scroll into view
+        var r = trigger.getBoundingClientRect();
+        if (r.top >= window.innerHeight || r.bottom <= 0) {
+          trigger.scrollIntoView({ block: 'center' });
+          await new Promise(function(ok) { setTimeout(ok, 150); });
+        }
+
+        // Phase 2: Click trigger to open
+        trigger.click();
+        trigger.dispatchEvent(new Event('input', { bubbles: true }));
+
+        // Wait + find option with retry
+        var optKey = key(optionTextParam);
+        var optionEl = null;
+
+        for (var attempt = 0; attempt < 3; attempt++) {
+          await new Promise(function(ok) { setTimeout(ok, attempt === 0 ? 300 : 300); });
+
+          var optionCandidates = document.querySelectorAll(
+            '[role="option"], [role="menuitem"], [role="menuitemradio"], ' +
+            '[class*="option"], [class*="item"], li'
+          );
+          var visibleOpts = [];
+          for (var j = 0; j < optionCandidates.length; j++) {
+            var opt = optionCandidates[j];
+            var rect = opt.getBoundingClientRect();
+            if (rect.width < 1 || rect.height < 1) continue;
+            var st = window.getComputedStyle(opt);
+            if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) continue;
+            visibleOpts.push(opt);
+          }
+
+          // Exact match first, then substring
+          for (var k = 0; k < visibleOpts.length; k++) {
+            if (key(visibleOpts[k].textContent || '') === optKey) {
+              optionEl = visibleOpts[k];
+              break;
+            }
+          }
+          if (!optionEl) {
+            for (var k2 = 0; k2 < visibleOpts.length; k2++) {
+              var oKey = key(visibleOpts[k2].textContent || '');
+              if (oKey.includes(optKey) || optKey.includes(oKey)) {
+                optionEl = visibleOpts[k2];
+                break;
+              }
+            }
+          }
+          if (optionEl) break;
+        }
+
+        if (!optionEl) throw new Error('Option not found in dropdown: ' + optionTextParam);
+
+        // Click option
+        var optRect = optionEl.getBoundingClientRect();
+        if (optRect.top >= window.innerHeight || optRect.bottom <= 0) {
+          optionEl.scrollIntoView({ block: 'center' });
+          await new Promise(function(ok) { setTimeout(ok, 100); });
+        }
+        optionEl.click();
+      })()`,
+    );
+  });
 };
 
 export const fillFormAction: ActionFn = async (tabId, params, options) => {
@@ -266,40 +310,21 @@ export const fillFormAction: ActionFn = async (tabId, params, options) => {
     return;
   }
 
-  if (selector) {
-    try {
-      await cdp.type(tabId, selector, value);
-      return;
-    } catch {
-      if (label) {
-        await cdp.fillByLabel(tabId, label, value);
-        return;
-      }
-      throw new Error(`Input not found by selector "${selector}" and no label fallback`);
-    }
+  const result = await resolveAndFill(
+    tabId,
+    { selector, label, context },
+    value,
+    { apiKey, llmProvider },
+  );
+  if (result.status !== "resolved") {
+    throw new Error(result.reason);
   }
-
-  if (label) {
-    if (apiKey) {
-      const resolved = await resolveElement(
-        tabId,
-        { action: "form.fill", label, context },
-        apiKey,
-        llmProvider,
-      );
-      if (resolved) {
-        try {
-          await cdp.type(tabId, resolved.selector, value);
-          return;
-        } catch {
-          // resolved selector failed — fall through to fillByLabel
-        }
-      }
-    }
-    await cdp.fillByLabel(tabId, label, value);
-  } else {
-    throw new Error("form.fill requires 'selector' or 'label'");
-  }
+  return {
+    strategy: result.strategy,
+    selector: result.selector,
+    ambiguous: result.ambiguous,
+    candidates: result.candidates,
+  };
 };
 
 const CHECK_CLICK_SCRIPT = `
@@ -320,10 +345,6 @@ function fluxCheckClick(el) {
     }
   }
   el.click();
-  if (isCheckable) {
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-  }
 }`;
 
 export const checkAction: ActionFn = async (tabId, params, options) => {
@@ -344,10 +365,14 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
     return;
   }
 
-  const hasDynamicSelector =
-    typeof selector === "string" && /_uid_|uid_/i.test(selector);
+  // selector가 동적(_uid_)이거나 위치기반(nth 2개+)이면 신뢰하지 않는다.
+  // 라디오/체크는 nth selector가 재생 때 다른 항목(예: 계좌이체↔신용카드)을 가리키기 쉬워,
+  // label이 있으면 label 매칭을 우선한다. selector는 label이 없을 때만 최후 수단.
+  const unreliableSelector =
+    isDynamicSelector(selector) || isBrittleSelector(selector);
+  const trustSelector = selector && !unreliableSelector;
 
-  if (selector && !hasDynamicSelector) {
+  if (trustSelector) {
     try {
       await cdp.evaluate(
         tabId,
@@ -365,6 +390,22 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
     } catch {
       if (!label) throw new Error(`Checkbox not found by selector "${selector}" and no label fallback`);
     }
+  }
+  // 신뢰 못 할 selector인데 label도 없으면, 그 selector라도 최후로 시도(아예 못 누르는 것보단 낫다)
+  if (!label && selector) {
+    await cdp.evaluate(
+      tabId,
+      `(() => {
+        ${CHECK_CLICK_SCRIPT}
+        var el = document.querySelector(${JSON.stringify(selector)});
+        if (!el) throw new Error('Element not found: ' + ${JSON.stringify(selector)});
+        var clickOnly = ${JSON.stringify(clickOnly)};
+        var wantChecked = ${JSON.stringify(checked)};
+        if (!clickOnly && wantChecked !== null && wantChecked !== undefined && el.checked !== undefined && el.checked === wantChecked) return;
+        fluxCheckClick(el);
+      })()`,
+    );
+    return;
   }
 
   if (label) {
@@ -402,17 +443,27 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
           return key(parent ? (parent.textContent || '') : '');
         }
 
+        function isVisible(cb) {
+          var rect = cb.getBoundingClientRect();
+          if (rect.width < 1 || rect.height < 1) return false;
+          var st = window.getComputedStyle(cb);
+          if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+          return true;
+        }
+
         var best = null;
         var bestScore = -1;
         for (var i = 0; i < allCheckables.length; i++) {
           var cb = allCheckables[i];
+          if (!isVisible(cb)) continue;
           var id = cb.id || '';
           var lbl = id ? document.querySelector('label[for="' + id.replace(/"/g, '\\\\"') + '"]') : cb.closest('label');
           var candidateKey = getCandidateText(cb, lbl);
           if (!candidateKey) continue;
-          var textMatch = candidateKey.indexOf(target) >= 0 || target.indexOf(candidateKey) >= 0;
-          if (!textMatch) continue;
-          var score = 100;
+          var exactMatch = candidateKey === target;
+          var partialMatch = candidateKey.indexOf(target) >= 0 || target.indexOf(candidateKey) >= 0;
+          if (!exactMatch && !partialMatch) continue;
+          var score = exactMatch ? 160 : 100;
           if (contextKey) {
             var ctx = getContextText(cb);
             if (ctx.indexOf(contextKey) >= 0) score += 60;
@@ -455,20 +506,27 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
 
 export const keypressAction: ActionFn = async (tabId, params, options) => {
   const key = params?.key;
-  const selector = params?.selector;
+  const selector = isDynamicSelector(params?.selector) ? undefined : params?.selector;
 
   if (!key) throw new Error("keyboard.press requires 'key' param");
 
   if (options?.validationOnly) return;
 
-  const targetSelector = selector ? JSON.stringify(selector) : "null";
-  await cdp.evaluate(
-    tabId,
-    `(() => {
-      var el = ${targetSelector} ? document.querySelector(${targetSelector}) : document.activeElement || document.body;
-      if (!el) el = document.body;
-      el.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true }));
-      el.dispatchEvent(new KeyboardEvent('keyup', { key: ${JSON.stringify(key)}, bubbles: true }));
-    })()`,
-  );
+  // 엔터는 "직전에 입력한 input"에 가야 검색이 발동한다. 그래서:
+  // - 현재 focus가 이미 input/textarea면 그대로 둔다(직전 fill이 잡아둔 focus).
+  // - selector가 input/textarea를 가리킬 때만 focus를 옮긴다(검색 버튼 등으로 옮겨 빈 엔터가 가는 것 방지).
+  if (key === "Enter") {
+    const focusIsInput = await cdp.evaluate(
+      tabId,
+      `(() => { var a = document.activeElement; return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA'); })()`,
+    );
+    if (!focusIsInput && selector) {
+      await cdp.focusElement(tabId, selector);
+    }
+  } else if (selector) {
+    await cdp.focusElement(tabId, selector);
+  }
+  // 합성 KeyboardEvent는 isTrusted=false라 검색창 submit이 무시된다.
+  // CDP 실제 키입력으로 보내 진짜 사용자 엔터처럼 동작시킨다.
+  await cdp.pressKey(tabId, key);
 };

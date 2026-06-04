@@ -4,6 +4,7 @@
  */
 
 import { DOM_PAGE_SUMMARY_SCRIPT } from "@/services/domSnapshot";
+import { buildClientActiveScopeScript } from "@/services/scopeResolver";
 
 /** React 등 제어 컴포넌트에서 value 직접 대입이 무시되는 경우 대비 (네이티브 setter + InputEvent) */
 const FLUX_SET_INPUT_VALUE_JS = `
@@ -26,6 +27,41 @@ function __fluxSetInputValue(el, text) {
     el.dispatchEvent(new Event('input', { bubbles: true }));
   }
   el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+`.trim();
+
+/**
+ * selector로 element를 찾을 때 활성 모달을 우선 검색하고, visible 우선으로 고른다.
+ * 모달에서 visible한 게 없으면 document 전체로 fallback.
+ */
+const FLUX_PICK_VISIBLE_BY_SELECTOR_JS = `
+${buildClientActiveScopeScript()}
+function __fluxIsVisibleEnough(el) {
+  if (!el) return false;
+  var rect = el.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return false;
+  var st = window.getComputedStyle(el);
+  if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+  return true;
+}
+function __fluxPickFirstVisible(list) {
+  for (var i = 0; i < list.length; i++) {
+    if (__fluxIsVisibleEnough(list[i])) return list[i];
+  }
+  return list.length > 0 ? list[0] : null;
+}
+function __fluxPickVisibleBySelector(selector) {
+  var modal = fluxFindActiveModal();
+  if (modal) {
+    var inModal = [].slice.call(modal.querySelectorAll(selector));
+    if (inModal.length > 0) {
+      var hit = __fluxPickFirstVisible(inModal);
+      if (hit && __fluxIsVisibleEnough(hit)) return hit;
+    }
+  }
+  var all = [].slice.call(document.querySelectorAll(selector));
+  if (all.length === 0) return null;
+  return __fluxPickFirstVisible(all);
 }
 `.trim();
 
@@ -80,7 +116,26 @@ function __fluxPickFillTargetByLabel(raw) {
     var parent = inp.closest('.form-group, .field, [class*="input"], [class*="form"]');
     if (parent && __fluxNormalizeFillLabel(parent.textContent || '').includes(target)) add(inp);
   }
-  if (candidates.length === 0) return null;
+  // 폴백: 라벨/placeholder로 못 찾았을 때.
+  // 주소찾기 검색창처럼 모달 안에 입력 가능한 텍스트 input이 하나뿐이면 그것을 쓴다.
+  if (candidates.length === 0) {
+    function __fluxIsTypable(el) {
+      if (el.tagName === 'SELECT') return false;
+      var t = (el.getAttribute('type') || '').toLowerCase();
+      if (t === 'hidden' || t === 'checkbox' || t === 'radio' || t === 'submit' || t === 'button') return false;
+      if (el.disabled || el.readOnly) return false;
+      var rect = el.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) return false;
+      var st = window.getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden') return false;
+      return true;
+    }
+    var typable = inputs.filter(__fluxIsTypable);
+    var inOverlay = typable.filter(__fluxInOverlayContainer);
+    if (inOverlay.length === 1) return inOverlay[0];
+    if (typable.length === 1) return typable[0];
+    return null;
+  }
   function isVisibleEnough(el) {
     var rect = el.getBoundingClientRect();
     var vw = window.innerWidth || 0;
@@ -130,6 +185,46 @@ function __fluxPickFillTargetByLabel(raw) {
 const CDP_VERSION = "1.3";
 const attachedTabRefCount = new Map<number, number>();
 
+// ── networkidle 추적 ──────────────────────────────────────────────
+// 버튼 클릭 → API 호출 → 응답 → DOM 갱신 흐름에서, DOM이 조용한 시점을 "완료"로
+// 오판하지 않도록 진행 중(in-flight) 네트워크 요청 수를 tabId별로 센다.
+const inFlightRequests = new Map<number, Set<string>>();
+let networkEventListenerRegistered = false;
+
+function bumpRequest(tabId: number, requestId: string, delta: 1 | -1): void {
+  let set = inFlightRequests.get(tabId);
+  if (!set) {
+    if (delta < 0) return;
+    set = new Set();
+    inFlightRequests.set(tabId, set);
+  }
+  if (delta > 0) set.add(requestId);
+  else set.delete(requestId);
+}
+
+function getInFlightCount(tabId: number): number {
+  return inFlightRequests.get(tabId)?.size ?? 0;
+}
+
+function ensureNetworkEventListener(): void {
+  if (networkEventListenerRegistered) return;
+  networkEventListenerRegistered = true;
+  chrome.debugger.onEvent.addListener((source, method, params: any) => {
+    const tabId = source.tabId;
+    if (tabId == null || !inFlightRequests.has(tabId)) return;
+    const reqId = params?.requestId;
+    if (!reqId) return;
+    if (method === "Network.requestWillBeSent") {
+      bumpRequest(tabId, reqId, 1);
+    } else if (
+      method === "Network.loadingFinished" ||
+      method === "Network.loadingFailed"
+    ) {
+      bumpRequest(tabId, reqId, -1);
+    }
+  });
+}
+
 export function isAttached(tabId: number): boolean {
   return (attachedTabRefCount.get(tabId) ?? 0) > 0;
 }
@@ -158,9 +253,18 @@ export async function attachToTab(tabId: number): Promise<void> {
         return;
       }
       attachedTabRefCount.set(tabId, 1);
+      enableNetworkTracking(tabId);
       resolve();
     });
   });
+}
+
+/** networkidle용 Network 도메인 enable + in-flight Set 초기화. attach 직후 호출. */
+function enableNetworkTracking(tabId: number): void {
+  ensureNetworkEventListener();
+  inFlightRequests.set(tabId, new Set());
+  // best-effort: enable 실패해도 다른 기능은 동작해야 하므로 에러 무시
+  sendCommand(tabId, "Network.enable", {}).catch(() => {});
 }
 
 export async function detachFromTab(tabId: number): Promise<void> {
@@ -170,6 +274,7 @@ export async function detachFromTab(tabId: number): Promise<void> {
     return;
   }
   attachedTabRefCount.delete(tabId);
+  inFlightRequests.delete(tabId);
 
   return new Promise((resolve) => {
     chrome.debugger.detach({ tabId }, () => {
@@ -291,12 +396,49 @@ const READY_POLL_MS = 80;
 const READY_DOM_QUIET_MS = 200;
 const READY_MAX_WAIT_MS = 15000;
 
+// networkidle: in-flight 요청이 0인 상태가 NETWORK_IDLE_MS 동안 유지되면 "네트워크 안정"으로 간주
+const NETWORK_IDLE_MS = 500;
+const NETWORK_IDLE_POLL_MS = 100;
+const NETWORK_IDLE_MAX_WAIT_MS = 15000;
+
+/**
+ * 진행 중인 네트워크 요청이 0인 상태가 NETWORK_IDLE_MS 동안 이어질 때까지 대기.
+ * 버튼 클릭 후 API 응답이 끝나고 화면이 갱신될 시간을 벌어준다.
+ * Network 추적이 비활성(미attach 등)이면 즉시 반환한다.
+ */
+export async function waitForNetworkIdle(tabId: number): Promise<void> {
+  if (!inFlightRequests.has(tabId)) return;
+  const deadline = Date.now() + NETWORK_IDLE_MAX_WAIT_MS;
+  let idleSince: number | null = null;
+  while (Date.now() < deadline) {
+    if (getInFlightCount(tabId) === 0) {
+      if (idleSince == null) idleSince = Date.now();
+      if (Date.now() - idleSince >= NETWORK_IDLE_MS) return;
+    } else {
+      idleSince = null;
+    }
+    await sleep(NETWORK_IDLE_POLL_MS);
+  }
+}
+
+// expectChange 모드에서, 액션 직후 첫 DOM 변화(로딩 시작)를 이만큼 기다린다.
+// 그 안에 변화가 없으면(이미 끝났거나 변화 없는 액션) 그냥 통과해 무한 대기를 막는다.
+const READY_CHANGE_START_MS = 1200;
+
 /**
  * 문서 로드 완료 후, DOM이 더 이상 바뀌지 않을 때까지 대기(실제 렌더 안정).
  * - document.readyState === 'complete'|'interactive' 일 때까지 폴링
  * - MutationObserver로 DOM 변경 감지 후, 변경이 READY_DOM_QUIET_MS 동안 없으면 "렌더 완료"로 간주
+ *
+ * @param opts.expectChange true면 액션 직후 호출용 — "변화 시작"을 먼저 기다린 뒤 quiet 판정.
+ *   클릭 → (로딩 스피너/네트워크) → 결과 흐름에서 변화가 시작되기도 전에 "조용함=완료"로
+ *   오판하는 것을 막는다. 변화가 READY_CHANGE_START_MS 안에 없으면 통과.
  */
-export async function waitForPageReady(tabId: number): Promise<void> {
+export async function waitForPageReady(
+  tabId: number,
+  opts?: { expectChange?: boolean },
+): Promise<void> {
+  const expectChange = opts?.expectChange ?? false;
   const deadline = Date.now() + READY_MAX_WAIT_MS;
   while (Date.now() < deadline) {
     try {
@@ -309,13 +451,17 @@ export async function waitForPageReady(tabId: number): Promise<void> {
         tabId,
         `new Promise(function(resolve) {
           var quietMs = ${READY_DOM_QUIET_MS};
+          var expectChange = ${expectChange ? "true" : "false"};
+          var changeStartMs = ${READY_CHANGE_START_MS};
           var timer = null;
+          var changed = false;
           var done = function() {
             if (timer) clearTimeout(timer);
             observer.disconnect();
             resolve();
           };
           var observer = new MutationObserver(function() {
+            changed = true;
             if (timer) clearTimeout(timer);
             timer = setTimeout(done, quietMs);
           });
@@ -327,7 +473,13 @@ export async function waitForPageReady(tabId: number): Promise<void> {
             attributes: true,
             characterData: true
           });
-          timer = setTimeout(done, quietMs);
+          if (expectChange) {
+            // 변화가 시작되면 위 observer가 quiet 타이머를 건다.
+            // changeStartMs 안에 아무 변화도 없으면(이미 끝났거나 변화 없는 액션) 통과.
+            timer = setTimeout(function() { if (!changed) done(); }, changeStartMs);
+          } else {
+            timer = setTimeout(done, quietMs);
+          }
         })`,
       );
       return;
@@ -379,7 +531,8 @@ export async function click(tabId: number, selector: string, options?: { skipCli
     tabId,
     `(async () => {
       ${buildHighlightAndActScript(shouldClick)}
-      const el = document.querySelector(${JSON.stringify(selector)});
+      ${FLUX_PICK_VISIBLE_BY_SELECTOR_JS}
+      const el = __fluxPickVisibleBySelector(${JSON.stringify(selector)});
       if (!el) throw new Error('Element not found: ${selector}');
       const r = el.getBoundingClientRect();
       const outOfViewport = r.top >= window.innerHeight || r.bottom <= 0;
@@ -504,13 +657,38 @@ export async function selectOption(
   tabId: number,
   selector: string,
   value: string,
+  optionText?: string,
 ): Promise<void> {
   await evaluate(
     tabId,
     `(() => {
-      var el = document.querySelector(${JSON.stringify(selector)});
+      ${FLUX_PICK_VISIBLE_BY_SELECTOR_JS}
+      var el = __fluxPickVisibleBySelector(${JSON.stringify(selector)});
       if (!el) throw new Error('Select not found: ${selector}');
-      el.value = ${JSON.stringify(value)};
+      var optionText = ${JSON.stringify(optionText ?? "")};
+      var targetValue = ${JSON.stringify(value)};
+      var norm = function(s) { return (s || '').trim().replace(/\\s+/g, ' ').toLowerCase(); };
+
+      if (el.tagName === 'SELECT') {
+        var opts = [].slice.call(el.options);
+        var matched = null;
+
+        if (optionText) {
+          var nt = norm(optionText);
+          matched = opts.find(function(o) { return norm(o.text) === nt; })
+                 || opts.find(function(o) { return norm(o.text).includes(nt) || nt.includes(norm(o.text)); });
+        }
+        if (!matched && targetValue) {
+          matched = opts.find(function(o) { return o.value === targetValue; })
+                 || opts.find(function(o) { return norm(o.text) === norm(targetValue); })
+                 || opts.find(function(o) { return norm(o.text).includes(norm(targetValue)) || norm(targetValue).includes(norm(o.text)); });
+        }
+        if (!matched) throw new Error('Option not found: ' + (optionText || targetValue));
+        el.value = matched.value;
+      } else {
+        el.value = targetValue;
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
     })()`,
   );
@@ -759,24 +937,156 @@ export async function clickLoginInGNB(
   );
 }
 
-export async function type(
+/**
+ * 입력 대상 요소를 페이지에서 준비한다(스코프 우선). 반환: { kind }
+ * - radio/checkbox(kind='checkable')는 여기서 바로 click한다(값 대입 무의미).
+ * - text input/textarea(kind='text')는 focus + 기존 값 비우기만 한다.
+ *   실제 입력은 호출부에서 CDP 키입력(insertText) → 실패 시 value 대입 fallback 순으로.
+ *   여기서 value를 미리 넣으면 이후 insertText와 누적돼 "값값" 중복이 되므로 넣지 않는다.
+ * - 그 외(custom)는 즉시 value 대입(키입력이 의미 없으므로).
+ *
+ * pickScript: 페이지 컨텍스트에서 대상 el을 찾아 변수 `el`에 바인딩하는 JS 조각.
+ */
+async function prepareInputTarget(
   tabId: number,
-  selector: string,
-  text: string,
+  pickScript: string,
+  value: string,
+): Promise<{ kind: "checkable" | "text" | "other" }> {
+  const kind = await evaluate(
+    tabId,
+    `(() => {
+      ${FLUX_SET_INPUT_VALUE_JS}
+      ${pickScript}
+      if (!el) throw new Error('Input target not found');
+      var t = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
+      var tag = el.tagName;
+      if (tag === 'INPUT' && (t === 'radio' || t === 'checkbox')) {
+        try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+        var lbl = el.id ? document.querySelector('label[for="' + el.id.replace(/"/g, '\\\\"') + '"]') : null;
+        (lbl || el).click();
+        return 'checkable';
+      }
+      if (tag === 'INPUT' || tag === 'TEXTAREA') {
+        try { el.focus(); } catch (e) {}
+        // 기존 값을 비우고(이전 입력/자동완성 잔여 제거) 전체 선택 상태로 둔다.
+        // value는 여기서 넣지 않는다 — insertText가 채운다.
+        try {
+          var setter = Object.getOwnPropertyDescriptor(
+            tag === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype, 'value'
+          );
+          if (setter && setter.set) setter.set.call(el, ''); else el.value = '';
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        } catch (e) {}
+        try { if (el.select) el.select(); } catch (e) {}
+        return 'text';
+      }
+      __fluxSetInputValue(el, ${JSON.stringify(value)});
+      return 'other';
+    })()`,
+  );
+  return { kind: (kind as any) || "other" };
+}
+
+/** 텍스트 입력 fallback: CDP 키입력이 실패했을 때만 value 대입으로 채운다(스코프 우선). */
+async function fillValueFallback(
+  tabId: number,
+  pickScript: string,
+  value: string,
 ): Promise<void> {
   await evaluate(
     tabId,
     `(() => {
       ${FLUX_SET_INPUT_VALUE_JS}
-      const el = document.querySelector(${JSON.stringify(selector)});
-      if (!el) throw new Error('Element not found: ${selector}');
-      el.focus();
-      if (el.select && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
-        try { el.select(); } catch (e) {}
-      }
-      __fluxSetInputValue(el, ${JSON.stringify(text)});
+      ${pickScript}
+      if (!el) return;
+      __fluxSetInputValue(el, ${JSON.stringify(value)});
     })()`,
   );
+}
+
+/** CDP 실제 키입력. 현재 focus된 요소에 진짜 사용자 입력처럼 텍스트를 삽입한다. */
+async function insertTextViaCDP(tabId: number, text: string): Promise<void> {
+  // Input.insertText: IME/한글 조합까지 안전한 "실제 텍스트 삽입". isTrusted 이벤트 발생.
+  await sendCommand(tabId, "Input.insertText", { text });
+}
+
+/** 주요 특수키의 CDP dispatchKeyEvent 파라미터. (검색창 엔터 submit 등에 필요) */
+const CDP_KEY_PARAMS: Record<
+  string,
+  { key: string; code: string; keyCode: number; text?: string }
+> = {
+  Enter: { key: "Enter", code: "Enter", keyCode: 13, text: "\r" },
+  Tab: { key: "Tab", code: "Tab", keyCode: 9 },
+  Escape: { key: "Escape", code: "Escape", keyCode: 27 },
+  Backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+  ArrowDown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+  ArrowUp: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+};
+
+/**
+ * CDP로 진짜 키 입력(keyDown/keyUp)을 보낸다. 합성 KeyboardEvent와 달리 isTrusted=true라
+ * 검색창의 엔터 submit, 폼 기본 동작이 실제로 발동한다.
+ * 알 수 없는 키는 best-effort로 key/code만 채워 보낸다.
+ */
+export async function pressKey(tabId: number, key: string): Promise<void> {
+  const p = CDP_KEY_PARAMS[key] || { key, code: key, keyCode: 0 };
+  // Enter는 keyDown에 text("\r")를 실어야 일부 input에서 submit이 발동한다.
+  await sendCommand(tabId, "Input.dispatchKeyEvent", {
+    type: p.text ? "keyDown" : "rawKeyDown",
+    key: p.key,
+    code: p.code,
+    windowsVirtualKeyCode: p.keyCode,
+    nativeVirtualKeyCode: p.keyCode,
+    ...(p.text ? { text: p.text } : {}),
+  });
+  await sendCommand(tabId, "Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: p.key,
+    code: p.code,
+    windowsVirtualKeyCode: p.keyCode,
+    nativeVirtualKeyCode: p.keyCode,
+  });
+}
+
+/** 모달 스코프 우선으로 selector 요소를 focus시킨다(키 입력 전 대상 지정용). */
+export async function focusElement(tabId: number, selector: string): Promise<boolean> {
+  return cdp_focusInScope(tabId, selector);
+}
+async function cdp_focusInScope(tabId: number, selector: string): Promise<boolean> {
+  try {
+    return await evaluate(
+      tabId,
+      `(() => {
+        ${buildClientActiveScopeScript()}
+        var el = fluxQueryInScope(${JSON.stringify(selector)});
+        if (!el) return false;
+        try { el.focus(); } catch (e) {}
+        return document.activeElement === el;
+      })()`,
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function type(
+  tabId: number,
+  selector: string,
+  text: string,
+): Promise<void> {
+  const scopedPick = `${buildClientActiveScopeScript()}\nvar el = fluxQueryInScope(${JSON.stringify(selector)});`;
+  const { kind } = await prepareInputTarget(tabId, scopedPick, text);
+  if (kind === "text") {
+    let ok = false;
+    try {
+      await insertTextViaCDP(tabId, text);
+      ok = true;
+    } catch {
+      ok = false;
+    }
+    // insertText가 실패했거나 값이 안 들어갔으면 value 대입으로 폴백(중복 방지: 성공 시엔 안 함)
+    if (!ok) await fillValueFallback(tabId, scopedPick, text);
+  }
 }
 
 export async function fillByLabel(
@@ -784,19 +1094,105 @@ export async function fillByLabel(
   label: string,
   value: string,
 ): Promise<void> {
+  const pick =
+    `${FLUX_PICK_FILL_TARGET_BY_LABEL_JS}\n` +
+    `var el = __fluxPickFillTargetByLabel(${JSON.stringify(label)});`;
+  const { kind } = await prepareInputTarget(tabId, pick, value);
+  if (kind === "text") {
+    let ok = false;
+    try {
+      await insertTextViaCDP(tabId, value);
+      ok = true;
+    } catch {
+      ok = false;
+    }
+    if (!ok) await fillValueFallback(tabId, pick, value);
+  }
+}
+
+/**
+ * label 텍스트로 <select>를 찾아 optionText 또는 value로 옵션을 선택한다.
+ * fillByLabel과 달리 SELECT 전용 로직으로, option 텍스트 매칭을 우선한다.
+ */
+export async function selectByLabel(
+  tabId: number,
+  label: string,
+  value: string,
+  optionText?: string,
+): Promise<void> {
   await evaluate(
     tabId,
     `(() => {
-      ${FLUX_SET_INPUT_VALUE_JS}
       ${FLUX_PICK_FILL_TARGET_BY_LABEL_JS}
-      const raw = ${JSON.stringify(label)};
-      const el = __fluxPickFillTargetByLabel(raw);
+      ${FLUX_PICK_VISIBLE_BY_SELECTOR_JS}
+      var raw = ${JSON.stringify(label)};
+      var el = __fluxPickFillTargetByLabel(raw);
       if (!el) throw new Error('Label not found: ' + raw);
-      el.focus();
-      if (el.select && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
-        try { el.select(); } catch (e) {}
+
+      // label로 찾은 요소가 SELECT가 아니면 가장 가까운 SELECT를 탐색
+      if (el.tagName !== 'SELECT') {
+        var parent = el.closest('.form-group, .field, [class*="select"], [class*="form"], dd, div');
+        var nearby = null;
+        if (parent) {
+          var selects = [].slice.call(parent.querySelectorAll('select'));
+          for (var i = 0; i < selects.length; i++) {
+            if (__fluxIsVisibleEnough(selects[i])) { nearby = selects[i]; break; }
+          }
+          if (!nearby && selects.length > 0) nearby = selects[0];
+        }
+        if (nearby) {
+          el = nearby;
+        } else {
+          throw new Error('SELECT element not found near label: ' + raw);
+        }
       }
-      __fluxSetInputValue(el, ${JSON.stringify(value)});
+
+      var optionText = ${JSON.stringify(optionText ?? "")};
+      var targetValue = ${JSON.stringify(value)};
+      var norm = function(s) { return (s || '').trim().replace(/\\s+/g, ' ').toLowerCase(); };
+      var opts = [].slice.call(el.options);
+      var matched = null;
+
+      if (optionText) {
+        var nt = norm(optionText);
+        matched = opts.find(function(o) { return norm(o.text) === nt; })
+               || opts.find(function(o) { return norm(o.text).includes(nt) || nt.includes(norm(o.text)); });
+      }
+      if (!matched && targetValue) {
+        matched = opts.find(function(o) { return o.value === targetValue; })
+               || opts.find(function(o) { return norm(o.text) === norm(targetValue); })
+               || opts.find(function(o) { return norm(o.text).includes(norm(targetValue)) || norm(targetValue).includes(norm(o.text)); });
+      }
+      if (!matched) throw new Error('Option not found for label "' + raw + '": ' + (optionText || targetValue));
+      el.value = matched.value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`,
+  );
+}
+
+/** label로 SELECT 요소 존재 여부만 확인 (검증 전용). */
+export async function checkSelectByLabel(tabId: number, label: string): Promise<void> {
+  await evaluate(
+    tabId,
+    `(() => {
+      ${FLUX_PICK_FILL_TARGET_BY_LABEL_JS}
+      ${FLUX_PICK_VISIBLE_BY_SELECTOR_JS}
+      var raw = ${JSON.stringify(label)};
+      var el = __fluxPickFillTargetByLabel(raw);
+      if (!el) throw new Error('Label not found: ' + raw);
+      if (el.tagName !== 'SELECT') {
+        var parent = el.closest('.form-group, .field, [class*="select"], [class*="form"], dd, div');
+        var nearby = null;
+        if (parent) {
+          var selects = [].slice.call(parent.querySelectorAll('select'));
+          for (var i = 0; i < selects.length; i++) {
+            if (__fluxIsVisibleEnough(selects[i])) { nearby = selects[i]; break; }
+          }
+          if (!nearby && selects.length > 0) nearby = selects[0];
+        }
+        if (!nearby) throw new Error('SELECT element not found near label: ' + raw);
+      }
     })()`,
   );
 }

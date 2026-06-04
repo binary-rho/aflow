@@ -1,6 +1,7 @@
 import * as cdp from "./cdp";
 import { executeAction, type StepResult } from "./actionRegistry";
 import type { Scenario } from "@/app/data";
+import { getScenarioEffectiveUrl, isSamePage } from "@/services/urlMatch";
 
 const DEFAULT_STEP_DELAY_MS = 300;
 
@@ -93,12 +94,27 @@ export async function runScenario(
   const results: StepResult[] = [];
   const stepDelayMs = options?.stepDelayMs ?? DEFAULT_STEP_DELAY_MS;
   let startFromIndex = options?.startFromIndex ?? 0;
-  if (
-    options?.skipLeadingNavGoto &&
-    scenario.steps[0]?.actionId === "nav.goto" &&
-    startFromIndex === 0
-  ) {
-    startFromIndex = 1;
+  const firstStep = scenario.steps[0];
+  if (firstStep?.actionId === "nav.goto" && startFromIndex === 0) {
+    if (options?.skipLeadingNavGoto) {
+      // 체인 2번째부터 등 명시적 강제 skip
+      startFromIndex = 1;
+    } else {
+      // 자동 판단: 현재 탭이 이미 시나리오 시작 페이지면 nav.goto 생략하여
+      // 본인인증 등 수동으로 만들어둔 상태를 보존
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        const currentUrl = tab?.url ?? "";
+        const targetUrl = getScenarioEffectiveUrl(scenario);
+        const same = !!currentUrl && !!targetUrl && isSamePage(currentUrl, targetUrl);
+        console.log(`[flux] auto skip check: current="${currentUrl}" target="${targetUrl}" same=${same}`);
+        if (same) {
+          startFromIndex = 1;
+        }
+      } catch (err: any) {
+        console.warn(`[flux] auto skip check failed: ${err?.message}`);
+      }
+    }
   }
   const onPageDomCaptured = options?.onPageDomCaptured;
 
@@ -198,6 +214,10 @@ export async function runScenario(
         return false;
       }
 
+      // 액션 직후: 변화 시작을 먼저 기다리고(expectChange), 네트워크가 잦아들 때까지,
+      // 그 다음 DOM이 안정될 때까지 대기. "API로 늦게 뜨는 화면을 빨리 지나감" 방지.
+      await cdp.waitForPageReady(currentTabId, { expectChange: true });
+      await cdp.waitForNetworkIdle(currentTabId);
       await cdp.waitForPageReady(currentTabId);
       await sleep(stepDelayMs);
 

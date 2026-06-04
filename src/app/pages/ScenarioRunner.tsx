@@ -12,6 +12,8 @@ import {
   Video,
   Square,
   SkipForward,
+  Search,
+  ChevronDown,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { ACTION_REGISTRY } from "../data";
@@ -91,6 +93,26 @@ export default function ScenarioRunner() {
   const [contextInvalidated, setContextInvalidated] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
+  /** 매칭 진단 메타 (strategy/selector/durationMs). 토글 펼쳤을 때 표시. */
+  const [stepMetas, setStepMetas] = useState<
+    Record<string, { strategy?: string; selector?: string; durationMs?: number }>
+  >({});
+  const [debugOpen, setDebugOpen] = useState<Record<string, boolean>>({});
+  /**
+   * 실행 중 "애매하게 지나간" 스텝 모음(사후 확인용).
+   * key=stepId. 성공해도 틀리게 지나갔을 수 있는 스텝(ambiguous / text-only)을 모아
+   * 종료 후 사용자에게 후보를 보여주고 확정받는다.
+   */
+  const [ambiguousSteps, setAmbiguousSteps] = useState<
+    Record<
+      string,
+      {
+        stepLabel: string;
+        usedSelector?: string;
+        candidates: { selector: string; text: string | null; context: string | null }[];
+      }
+    >
+  >({});
   const [speedPreset, setSpeedPreset] = useState<StepDelayPreset>(() =>
     getStepDelayPreset(),
   );
@@ -259,13 +281,45 @@ export default function ScenarioRunner() {
 
       const newStatuses: Record<string, StepStatus> = {};
       const newStepErrors: Record<string, string> = {};
+      const newStepMetas: Record<string, { strategy?: string; selector?: string; durationMs?: number }> = {};
+      const newAmbiguous: typeof ambiguousSteps = {};
       active.steps.forEach((step, i) => {
-        const result = state.stepResults[i];
+        const result = state.stepResults[i] as
+          | (typeof state.stepResults[number] & {
+              strategy?: string;
+              selector?: string;
+              durationMs?: number;
+              ambiguous?: boolean;
+              candidates?: { selector: string; text: string | null; context: string | null }[];
+            })
+          | undefined;
         if (result) {
           newStatuses[step.id] =
             result.status === "skipped" ? "todo" : result.status;
           if (result.status === "failed" && result.error) {
             newStepErrors[step.id] = result.error;
+          }
+          if (result.strategy || result.selector || result.durationMs != null) {
+            newStepMetas[step.id] = {
+              strategy: result.strategy,
+              selector: result.selector,
+              durationMs: result.durationMs,
+            };
+          }
+          // 성공해도 "틀리게 지나갔을 수 있는" 스텝 수집: AI/코드가 확신 못 함(ambiguous)
+          // 또는 text-only(여러 개 중 그냥 첫 번째 잡음)이고 후보가 2개+ 있을 때.
+          const looksAmbiguous =
+            result.ambiguous || result.strategy === "text-only";
+          if (looksAmbiguous && result.candidates && result.candidates.length > 1) {
+            newAmbiguous[step.id] = {
+              stepLabel:
+                (step.params?.text as string) ||
+                (step.params?.label as string) ||
+                ACTION_REGISTRY[step.actionId]?.name ||
+                step.actionId,
+              usedSelector: result.selector,
+              candidates: result.candidates,
+            };
           }
         } else if (i === state.currentStepIndex && isActive) {
           newStatuses[step.id] = "running";
@@ -275,8 +329,41 @@ export default function ScenarioRunner() {
       });
       setStepStatuses(newStatuses);
       setStepErrors(newStepErrors);
+      setStepMetas(newStepMetas);
+      // 실행이 끝/멈춘 시점에만 사후확인 패널을 채운다(실행 중엔 비움).
+      if (state.status === "done" || state.status === "error") {
+        setAmbiguousSteps(newAmbiguous);
+      } else {
+        setAmbiguousSteps({});
+      }
     },
     [scenario, isRecording, stopRecording],
+  );
+
+  /**
+   * 사후확인에서 사용자가 "이게 맞아요"로 후보를 확정.
+   * 확정 selector를 해당 step의 params.selector로 저장 → 다음 재생 때 1순위로 검증·사용.
+   * (selector 캐시보다 직접적이고, 시나리오에 영구 박혀 무인 실행에도 반영됨)
+   */
+  const confirmAmbiguousChoice = useCallback(
+    (stepId: string, chosenSelector: string) => {
+      const current = id ? getScenarioById(id) : scenario;
+      if (!current) return;
+      const nextSteps = current.steps.map((s) =>
+        s.id === stepId
+          ? { ...s, params: { ...(s.params ?? {}), selector: chosenSelector } }
+          : s,
+      );
+      const updated = { ...current, steps: nextSteps };
+      saveScenario(updated);
+      setScenario(updated);
+      setAmbiguousSteps((prev) => {
+        const next = { ...prev };
+        delete next[stepId];
+        return next;
+      });
+    },
+    [id, scenario],
   );
 
   useEffect(() => {
@@ -586,6 +673,57 @@ export default function ScenarioRunner() {
               )}
             </div>
           )}
+
+          {Object.keys(ambiguousSteps).length > 0 && (
+            <div className="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-200 text-sm text-amber-900">
+              <p className="font-semibold">
+                애매하게 지나간 스텝이 있어요 ({Object.keys(ambiguousSteps).length}개)
+              </p>
+              <p className="mt-1 text-xs text-amber-700">
+                비슷한 후보가 여러 개라 확신 없이 진행했어요. 맞는 걸 골라주시면 다음
+                실행부터 그대로 사용합니다.
+              </p>
+              <div className="mt-3 space-y-3">
+                {Object.entries(ambiguousSteps).map(([stepId, info]) => (
+                  <div
+                    key={stepId}
+                    className="p-2 rounded-md bg-white border border-amber-200"
+                  >
+                    <p className="text-xs font-medium text-gray-700 mb-1.5">
+                      “{info.stepLabel}” — 어느 것이었나요?
+                    </p>
+                    <div className="space-y-1">
+                      {info.candidates.map((cand) => (
+                        <button
+                          key={cand.selector}
+                          type="button"
+                          onClick={() =>
+                            confirmAmbiguousChoice(stepId, cand.selector)
+                          }
+                          className={cn(
+                            "w-full text-left px-2 py-1.5 rounded border text-xs transition-colors",
+                            cand.selector === info.usedSelector
+                              ? "border-amber-400 bg-amber-100/60 hover:bg-amber-100"
+                              : "border-gray-200 hover:bg-gray-50",
+                          )}
+                        >
+                          <span className="font-medium text-gray-800">
+                            {cand.text || "(텍스트 없음)"}
+                          </span>
+                          {cand.context && (
+                            <span className="text-gray-400"> · {cand.context}</span>
+                          )}
+                          {cand.selector === info.usedSelector && (
+                            <span className="ml-1 text-amber-600">(이번에 선택됨)</span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="absolute left-6 top-4 bottom-4 w-0.5 bg-gray-100" />
 
           <div className="space-y-6 relative pl-1">
@@ -687,6 +825,52 @@ export default function ScenarioRunner() {
                     {status === "failed" && stepErrors[step.id] && (
                       <div className="mt-3 p-2.5 rounded-lg bg-red-50 border border-red-100 text-xs text-red-700">
                         {stepErrors[step.id]}
+                      </div>
+                    )}
+
+                    {stepMetas[step.id] && (status === "success" || status === "failed") && (
+                      <div className="mt-2 pt-2 border-t border-gray-100">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setDebugOpen((prev) => ({
+                              ...prev,
+                              [step.id]: !prev[step.id],
+                            }))
+                          }
+                          className="text-[10px] text-gray-500 hover:text-gray-700 flex items-center gap-1 transition-colors"
+                        >
+                          <Search className="w-3 h-3" />
+                          디버그
+                          <ChevronDown
+                            className={cn(
+                              "w-3 h-3 transition-transform",
+                              debugOpen[step.id] && "rotate-180",
+                            )}
+                          />
+                        </button>
+                        {debugOpen[step.id] && (
+                          <div className="mt-2 p-2 rounded-md bg-gray-50 border border-gray-100 text-[10px] font-mono text-gray-600 space-y-0.5">
+                            {stepMetas[step.id].strategy && (
+                              <div>
+                                <span className="text-gray-400">strategy:</span>{" "}
+                                {stepMetas[step.id].strategy}
+                              </div>
+                            )}
+                            {stepMetas[step.id].selector && (
+                              <div className="break-all">
+                                <span className="text-gray-400">selector:</span>{" "}
+                                {stepMetas[step.id].selector}
+                              </div>
+                            )}
+                            {stepMetas[step.id].durationMs != null && (
+                              <div>
+                                <span className="text-gray-400">duration:</span>{" "}
+                                {stepMetas[step.id].durationMs}ms
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
 

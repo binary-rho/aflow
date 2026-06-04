@@ -136,7 +136,37 @@ const INJECT_SCRIPT = `
     return tagName + '[' + attrName + '="' + String(attrValue).replace(/"/g, '\\\\"') + '"]';
   }
 
-  function getSelector(el) {
+  // 의미 없는/상태성 클래스를 걸러, selector에 쓸 만한 안정 클래스만 남긴다.
+  // (domSnapshot.validCls와 같은 취지: active/open 등 토글성·프레임워크 접두사 제외)
+  function isStableClass(c) {
+    if (!c || c.length <= 1 || !/^[a-zA-Z_-]/.test(c)) return false;
+    if (/^(active|hover|focus|show|hide|open|close|visible|hidden|selected|disabled|current|enabled|collapsed|expanded|toggled|on|off|in|out)$/i.test(c)) return false;
+    if (/^(js-|ng-|v-|is-|has-|no-|not-|ui-|el-|ant-|data-v-)/i.test(c)) return false;
+    if (/[-_](active|hover|focus|show|hide|open|close|visible|hidden|selected|disabled|current)$/i.test(c)) return false;
+    return true;
+  }
+
+  // 안정 클래스 조합으로 document에서 유일한 selector를 찾는다. 없으면 null.
+  function buildStableClassSelector(el, tagName) {
+    var raw = (typeof el.className === 'string') ? el.className.trim() : '';
+    if (!raw) return null;
+    var classes = raw.split(/\\s+/).filter(isStableClass);
+    for (var i = 0; i < Math.min(classes.length, 4); i++) {
+      var s = '.' + escapeCss(classes[i]);
+      try { if (document.querySelectorAll(s).length === 1) return s; } catch (e) {}
+      var st = tagName + s;
+      try { if (document.querySelectorAll(st).length === 1) return st; } catch (e) {}
+    }
+    return null;
+  }
+
+  /**
+   * @param opts.allowBrittle true면 안정 식별자가 전혀 없을 때 nth-of-type 체인이라도 반환.
+   *   click은 text/context가 함께 저장돼 폴백되므로 false(불안정하면 null 반환 → text에 맡김).
+   *   input/checkbox 등 selector가 꼭 필요한 경우엔 true로 호출.
+   */
+  function getSelector(el, opts) {
+    var allowBrittle = opts && opts.allowBrittle;
     if (!el || !(el instanceof Element)) return null;
     var tagName = el.tagName.toLowerCase();
     if (el.id && isLikelyStableId(el.id)) return '#' + escapeCss(el.id);
@@ -180,6 +210,25 @@ const INJECT_SCRIPT = `
       }
     }
 
+    // 안정 식별자가 없을 때: 의미 있는 클래스로 유일 selector 시도
+    var byClass = buildStableClassSelector(el, tagName);
+    if (byClass) return byClass;
+
+    // 부모의 안정 클래스 + 자식 tag 조합으로도 한 번 시도(카드 내부 버튼 등)
+    var p = el.parentElement;
+    if (p) {
+      var pByClass = buildStableClassSelector(p, p.tagName.toLowerCase());
+      if (pByClass) {
+        var combo = pByClass + ' > ' + tagName;
+        try { if (document.querySelectorAll(combo).length === 1) return combo; } catch (e) {}
+      }
+    }
+
+    // 여기까지 왔으면 nth-of-type 체인밖에 없다 = 재생 시점에 다른 요소를 가리킬 위험(brittle).
+    // click은 text/context가 함께 저장돼 폴백되므로 selector를 비워 text 매칭에 맡긴다.
+    // 단 input/checkbox처럼 selector가 꼭 필요한 경우(allowBrittle)엔 nth라도 반환.
+    if (!allowBrittle) return null;
+
     var parts = [];
     var node = el;
     var maxDepth = 4;
@@ -219,7 +268,10 @@ const INJECT_SCRIPT = `
     }
     var inLabel = el.closest('label');
     if (inLabel) return norm(inLabel.textContent || '');
-    return norm(el.getAttribute('aria-label') || '') || norm(el.getAttribute('placeholder') || '') || norm(el.getAttribute('name') || '');
+    return norm(el.getAttribute('aria-label') || '')
+      || norm(el.getAttribute('placeholder') || '')
+      || norm(el.getAttribute('title') || '')
+      || norm(el.getAttribute('name') || '');
   }
 
   function send(data) {
@@ -245,9 +297,29 @@ const INJECT_SCRIPT = `
       if (labelEl) {
         var forId = labelEl.getAttribute('for');
         var assocInput = forId ? document.getElementById(forId) : labelEl.querySelector(CHECKABLE);
-        if (assocInput && assocInput.closest(CHECKABLE)) {
+        if (assocInput && assocInput.matches(CHECKABLE)) {
           checkTarget = assocInput;
         }
+      }
+    }
+    // 텍스트(span 등)를 클릭했고 label과 input이 형제이거나 컨테이너로 묶인 경우.
+    // 5G/LTE 라디오 탭, 요금제 카드 라디오/체크처럼 라벨 텍스트만 클릭되는 케이스를 잡는다.
+    if (!checkTarget) {
+      var radioBox = rawTarget.closest(
+        '.c-radio-box, .c-radio, .c-card-radio, .c-card-radio-2, .text-radio, .text-chkbox, .c-checkbox, .c-card-box, [class*="radio"], [class*="checkbox"], li'
+      );
+      if (radioBox) {
+        var boxInput = radioBox.querySelector(CHECKABLE);
+        // 라벨 for로 가리키는 input이 box 밖에 있을 수도 있으니 그것도 시도
+        if (!boxInput) {
+          var lblInBox = radioBox.querySelector('label[for]');
+          var fid = lblInBox && lblInBox.getAttribute('for');
+          if (fid) {
+            var byFor = document.getElementById(fid);
+            if (byFor && byFor.matches(CHECKABLE)) boxInput = byFor;
+          }
+        }
+        if (boxInput) checkTarget = boxInput;
       }
     }
     if (checkTarget) {
@@ -256,7 +328,7 @@ const INJECT_SCRIPT = `
       lastCheckEl = checkTarget;
       lastCheckTs = now;
       var chkLabel = getFieldLabel(checkTarget);
-      var chkSelector = getSelector(checkTarget);
+      var chkSelector = getSelector(checkTarget, { allowBrittle: true });
       var chkContext = getContext(checkTarget);
 
       var wrapper = checkTarget.closest('[data-gtm-event-label], .c-checkbox, .c-card-box');
@@ -268,18 +340,56 @@ const INJECT_SCRIPT = `
         }
       }
       if (!chkLabel || chkLabel.length > 40) {
-        var parentLabel = checkTarget.id
+        // label[for] → 감싼 label → 라디오/체크 컨테이너 순으로 텍스트 출처를 넓게 탐색.
+        // (5G 요금제처럼 <label class="text-radio"><span class="txt">…</span> 구조 포함)
+        var labelSource = (checkTarget.id
           ? document.querySelector('label[for="' + checkTarget.id.replace(/"/g, '\\\\"') + '"]')
-          : checkTarget.closest('label');
-        if (parentLabel) {
-          var altImg = parentLabel.querySelector('img[alt]');
-          if (altImg && altImg.getAttribute('alt')) chkLabel = norm(altImg.getAttribute('alt'));
-          var txtSpan = parentLabel.querySelector('.txt, .title, .tit, [class*="name"]');
-          if (txtSpan) chkLabel = norm(txtSpan.textContent || '') || chkLabel;
+          : null)
+          || checkTarget.closest('label')
+          || checkTarget.closest('.c-radio-box, .c-radio, .c-card-radio, .c-card-radio-2, .c-checkbox, .c-card-box, li');
+        if (labelSource) {
+          var altImg = labelSource.querySelector('img[alt]');
+          var txtSpan = labelSource.querySelector('.txt, .title, .tit, .contents__title, [class*="name"]');
+          if (txtSpan && norm(txtSpan.textContent || '')) chkLabel = norm(txtSpan.textContent || '');
+          else if (altImg && altImg.getAttribute('alt')) chkLabel = norm(altImg.getAttribute('alt'));
         }
       }
 
-      send({ type: 'check', label: chkLabel || chkSelector || '', clickOnly: true, selector: chkSelector, context: chkContext, ts: Date.now() });
+      // selector가 위치기반(nth 2개+)이면 재생 때 다른 항목을 가리키기 쉽다.
+      // label이 충분하면(2자 이상) selector를 비워 label 매칭에 맡긴다.
+      var brittle = chkSelector && (chkSelector.match(/:nth-(of-type|child)\\(/g) || []).length >= 2;
+      if (brittle && chkLabel && chkLabel.length >= 2) {
+        chkSelector = null;
+      }
+
+      var role = (checkTarget.getAttribute('role') || '').toLowerCase();
+      var isRadio = (checkTarget instanceof HTMLInputElement && checkTarget.type === 'radio') || role === 'radio';
+      var isCheckbox = (checkTarget instanceof HTMLInputElement && checkTarget.type === 'checkbox') || role === 'checkbox' || role === 'switch';
+      var payload = {
+        type: 'check',
+        label: chkLabel || chkSelector || '',
+        selector: chkSelector,
+        context: chkContext,
+        ts: Date.now()
+      };
+      // 커스텀 요소는 aria-checked로 상태를 읽는다(없으면 토글 후 상태 추정).
+      function readChecked(el) {
+        if (el instanceof HTMLInputElement) return !!el.checked;
+        var ac = el.getAttribute('aria-checked');
+        if (ac === 'true') return true;
+        if (ac === 'false') return false;
+        return null;
+      }
+      if (isRadio) {
+        payload.checked = true;
+      } else if (isCheckbox) {
+        var st = readChecked(checkTarget);
+        if (st === null) payload.clickOnly = true;
+        else payload.checked = st;
+      } else {
+        payload.clickOnly = true;
+      }
+      send(payload);
       return;
     }
 
@@ -289,34 +399,108 @@ const INJECT_SCRIPT = `
     }
     if (!target) return;
     var text = getText(target);
-    if (!text) return;
+    // text가 있으면 text 기반(selector는 없어도 됨).
+    // text가 없으면(CSS ::before 아이콘 버튼 등) selector로라도 기록해야 누락되지 않는다.
+    // → 이때는 brittle nth라도 확보. text·selector 둘 다 없으면 식별 불가라 버린다.
+    var selector = text ? getSelector(target) : getSelector(target, { allowBrittle: true });
+    if (!text && !selector) return;
     var context = getContext(target);
     var href = target.getAttribute('href');
     var inHeader = !!target.closest('header, nav, [role="navigation"], [class*="gnb"], [class*="menu"]');
-    var selector = getSelector(target);
     send({ type: 'click', text: text, selector: selector, context: context, href: href || null, inHeader: inHeader, ts: Date.now() });
   }, true);
 
-  document.addEventListener('change', function(event) {
-    var el = event.target;
-    if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement)) return;
-    if (el.disabled || (el instanceof HTMLInputElement && el.type === 'hidden')) return;
+  /**
+   * 입력 이벤트 처리 정책:
+   *   - input 이벤트로 타이핑 중간 값을 잡고 debounce(400ms)로 묶음 → 타임스탬프가 빠르게 확보
+   *   - change(blur) 이벤트는 backup. 같은 selector+value면 dedupe로 1회만 전송
+   *   - select는 label 없어도 selector 기반으로 잡힘
+   *   - keydown 직전 pending flush → 엔터 누르면 input이 항상 keypress보다 먼저 전송
+   */
+  var INPUT_DEBOUNCE_MS = 400;
+  var inputDebounceTimers = new Map(); // selector → timeoutId
+  var inputPending = new Map();        // selector → { el, ts }
+  var lastSentInputs = new Map();      // selector → value (dedupe)
 
-    if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
-      return;
+  function flushPendingInputForSelector(selector) {
+    var timer = inputDebounceTimers.get(selector);
+    if (timer != null) {
+      clearTimeout(timer);
+      inputDebounceTimers.delete(selector);
     }
+    var pending = inputPending.get(selector);
+    inputPending.delete(selector);
+    if (!pending) return;
+    sendInputIfChanged(pending.el, pending.ts);
+  }
 
+  function flushAllPendingInputs() {
+    var selectors = Array.from(inputDebounceTimers.keys());
+    selectors.forEach(flushPendingInputForSelector);
+  }
+
+  function sendInputIfChanged(el, ts) {
+    if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return;
+    if (el.disabled || (el instanceof HTMLInputElement && (el.type === 'hidden' || el.type === 'checkbox' || el.type === 'radio'))) return;
     var label = getFieldLabel(el);
     if (!label) return;
     var value = String(el.value || '').trim();
     if (!value) return;
+    var selector = getSelector(el, { allowBrittle: true });
+    var dedupeKey = (selector || '') + '\\x1f' + value;
+    if (lastSentInputs.get(selector || '') === value) return;
+    lastSentInputs.set(selector || '', value);
     var context = getContext(el);
-    var selector = getSelector(el);
+    send({ type: 'input', label: label, value: value, selector: selector, context: context, ts: ts });
+    void dedupeKey;
+  }
+
+  function sendSelect(el, ts) {
+    if (!(el instanceof HTMLSelectElement)) return;
+    if (el.disabled) return;
+    var value = String(el.value || '').trim();
+    if (!value) return;
+    var selector = getSelector(el, { allowBrittle: true });
+    if (lastSentInputs.get(selector || '') === value) return;
+    lastSentInputs.set(selector || '', value);
+    // select는 label이 없어도 selector로 매칭 가능. 다만 가능한 한 채워서 보냄.
+    var label = getFieldLabel(el) || norm(el.getAttribute('title') || '') || null;
+    var optText = el.options[el.selectedIndex] ? norm(el.options[el.selectedIndex].textContent || '') : value;
+    var context = getContext(el);
+    send({ type: 'select', label: label, value: value, optionText: optText, selector: selector, context: context, ts: ts });
+  }
+
+  // input 이벤트: 타이핑 중간에 발생. debounce로 묶음.
+  document.addEventListener('input', function(event) {
+    var el = event.target;
+    if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return;
+    if (el.disabled || (el instanceof HTMLInputElement && (el.type === 'hidden' || el.type === 'checkbox' || el.type === 'radio'))) return;
+    var selector = getSelector(el, { allowBrittle: true }) || '';
+    var existing = inputDebounceTimers.get(selector);
+    if (existing != null) clearTimeout(existing);
+    inputPending.set(selector, { el: el, ts: Date.now() });
+    var timer = setTimeout(function() {
+      inputDebounceTimers.delete(selector);
+      var pending = inputPending.get(selector);
+      inputPending.delete(selector);
+      if (pending) sendInputIfChanged(pending.el, pending.ts);
+    }, INPUT_DEBOUNCE_MS);
+    inputDebounceTimers.set(selector, timer);
+  }, true);
+
+  // change 이벤트: blur/select 변경 시 백업. select는 여기서만 확정.
+  document.addEventListener('change', function(event) {
+    var el = event.target;
+    if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement)) return;
+    if (el.disabled || (el instanceof HTMLInputElement && el.type === 'hidden')) return;
+    if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) return;
     if (el instanceof HTMLSelectElement) {
-      var optText = el.options[el.selectedIndex] ? norm(el.options[el.selectedIndex].textContent || '') : value;
-      send({ type: 'select', label: label, value: value, optionText: optText, selector: selector, context: context, ts: Date.now() });
+      sendSelect(el, Date.now());
     } else {
-      send({ type: 'input', label: label, value: value, selector: selector, context: context, ts: Date.now() });
+      // input/textarea의 change → debounce 펜딩이 있으면 그걸 먼저 flush
+      var selector = getSelector(el, { allowBrittle: true }) || '';
+      flushPendingInputForSelector(selector);
+      sendInputIfChanged(el, Date.now());
     }
   }, true);
 
@@ -363,6 +547,9 @@ const INJECT_SCRIPT = `
   var CAPTURE_KEYS = { Enter: true, Escape: true, Tab: true };
   document.addEventListener('keydown', function(event) {
     if (!CAPTURE_KEYS[event.key]) return;
+    // 엔터 등을 키프레스로 기록하기 전에 pending input debounce를 먼저 flush.
+    // 이렇게 해야 "사용자가 타이핑 → 엔터" 시퀀스가 항상 [input, keypress] 순서로 저장됨.
+    flushAllPendingInputs();
     var el = event.target instanceof Element ? event.target : null;
     var selector = el ? getSelector(el) : null;
     var context = el ? getContext(el) : null;
@@ -420,6 +607,7 @@ export async function startRecording(tabId: number): Promise<void> {
     if (method === "Runtime.bindingCalled" && params?.name === BINDING_NAME) {
       try {
         const event = JSON.parse(params.payload) as RecordedEvent;
+        console.log("[flux recorder] raw event:", JSON.stringify(event));
         collectedLogs.push(event);
       } catch {}
     }
