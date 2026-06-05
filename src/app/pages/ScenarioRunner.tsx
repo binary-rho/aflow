@@ -14,6 +14,7 @@ import {
   SkipForward,
   Search,
   ChevronDown,
+  Trash2,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { ACTION_REGISTRY } from "../data";
@@ -357,6 +358,55 @@ export default function ScenarioRunner() {
       const updated = { ...current, steps: nextSteps };
       saveScenario(updated);
       setScenario(updated);
+      setAmbiguousSteps((prev) => {
+        const next = { ...prev };
+        delete next[stepId];
+        return next;
+      });
+    },
+    [id, scenario],
+  );
+
+  /**
+   * 시나리오에서 특정 스텝을 영구 삭제.
+   * 실행 중에는 인덱스 꼬임 방지를 위해 호출 측에서 막는다.
+   * 부수 상태(status, error, meta, ambiguous)도 같이 정리해 다음 실행/렌더에 잔재가 안 남게 한다.
+   */
+  const handleDeleteStep = useCallback(
+    (stepId: string) => {
+      const current = id ? getScenarioById(id) : scenario;
+      if (!current) return;
+      const target = current.steps.find((s) => s.id === stepId);
+      if (!target) return;
+      const label =
+        target.description ||
+        ACTION_REGISTRY[target.actionId]?.name ||
+        target.actionId;
+      // 실수 방지: 시나리오 데이터는 localStorage라 되돌릴 수 없다.
+      if (!window.confirm(`이 스텝을 삭제할까요?\n\n"${label}"`)) return;
+
+      const nextSteps = current.steps.filter((s) => s.id !== stepId);
+      const updated = { ...current, steps: nextSteps };
+      saveScenario(updated);
+      setScenario(updated);
+      setDisplayScenario((prev) =>
+        prev && prev.id === updated.id ? updated : prev,
+      );
+      setStepStatuses((prev) => {
+        const next = { ...prev };
+        delete next[stepId];
+        return next;
+      });
+      setStepErrors((prev) => {
+        const next = { ...prev };
+        delete next[stepId];
+        return next;
+      });
+      setStepMetas((prev) => {
+        const next = { ...prev };
+        delete next[stepId];
+        return next;
+      });
       setAmbiguousSteps((prev) => {
         const next = { ...prev };
         delete next[stepId];
@@ -724,8 +774,6 @@ export default function ScenarioRunner() {
               </div>
             </div>
           )}
-          <div className="absolute left-6 top-4 bottom-4 w-0.5 bg-gray-100" />
-
           <div className="space-y-6 relative pl-1">
             {stepsForUi.map((step, index) => {
               const status = stepStatuses[step.id] || "idle";
@@ -751,6 +799,18 @@ export default function ScenarioRunner() {
                         : "opacity-90",
                   )}
                 >
+                  {/*
+                    스텝 동그라미 사이를 잇는 연결선.
+                    컨테이너 전체에 absolute로 그으면 알림박스/사후확인 영역이 켜졌다 꺼질 때
+                    또는 스텝 수가 바뀔 때 길이가 어긋난다. 각 카드 안에서 자기 동그라미 아래쪽~다음
+                    카드 동그라미 시작점까지만 잇도록 두면 항상 자동으로 맞는다.
+                    위치: 동그라미 (left-0, top-1, w-6 h-6) 중심선 12px → w-0.5 보정해 left-[11px].
+                          top-7 = 28px (동그라미 아래 끝), -bottom-6 = space-y-6(=24px) 만큼 더.
+                    마지막 스텝은 연결할 다음 카드가 없으므로 그리지 않는다.
+                  */}
+                  {index < stepsForUi.length - 1 && (
+                    <div className="absolute left-[11px] top-7 -bottom-6 w-0.5 bg-gray-200 -z-0" />
+                  )}
                   <div
                     className={cn(
                       "absolute left-0 top-1 w-6 h-6 rounded-full border-2 flex items-center justify-center z-10 transition-colors shadow-sm",
@@ -796,16 +856,29 @@ export default function ScenarioRunner() {
                       <span className="text-[10px] font-mono font-bold text-gray-400 bg-gray-50 px-1.5 py-0.5 rounded border border-gray-100">
                         Step {index + 1}
                       </span>
-                      <span
-                        className={cn(
-                          "text-[10px] uppercase font-bold px-1.5 py-0.5 rounded tracking-wide",
-                          isMissing
-                            ? "bg-amber-100 text-amber-700 border border-amber-200"
-                            : "bg-gray-100 text-gray-600 border border-gray-200",
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={cn(
+                            "text-[10px] uppercase font-bold px-1.5 py-0.5 rounded tracking-wide",
+                            isMissing
+                              ? "bg-amber-100 text-amber-700 border border-amber-200"
+                              : "bg-gray-100 text-gray-600 border border-gray-200",
+                          )}
+                        >
+                          {actionDef?.name || step.actionId}
+                        </span>
+                        {!isRunning && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteStep(step.id)}
+                            className="p-1 rounded-md text-gray-300 hover:text-red-600 hover:bg-red-50 transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100"
+                            title="이 스텝 삭제"
+                            aria-label="이 스텝 삭제"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
                         )}
-                      >
-                        {actionDef?.name || step.actionId}
-                      </span>
+                      </div>
                     </div>
 
                     <p className="text-sm font-medium text-gray-800 leading-snug">

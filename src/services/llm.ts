@@ -1,9 +1,19 @@
 import { ACTION_REGISTRY, type ActionDefinition } from "@/app/data";
-import { getLlmProvider, LLM_PROVIDER_OPTIONS } from "@/stores/settingsStore";
+import {
+  getLlmProvider,
+  LLM_PROVIDER_OPTIONS,
+  getAnthropicBaseUrl,
+} from "@/stores/settingsStore";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
-const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_MESSAGES_PATH = "/v1/messages";
 const ANTHROPIC_API_VERSION = "2023-06-01";
+
+// 회사 방화벽이 api.anthropic.com 직접 호출을 막는 경우, 설정에 사내 Anthropic 호환
+// 게이트웨이 base URL을 넣어 우회한다. domMatcher와 동일한 정책으로 처리.
+function buildAnthropicMessagesUrl(): string {
+  return `${getAnthropicBaseUrl()}${ANTHROPIC_MESSAGES_PATH}`;
+}
 
 function buildActionCatalog(): string {
   const implemented = Object.values(ACTION_REGISTRY).filter(
@@ -351,14 +361,23 @@ export async function generateDSL(
   let content: string;
 
   if (provider === "anthropic") {
-    const response = await fetch(ANTHROPIC_API_URL, {
+    const anthropicBaseUrl = getAnthropicBaseUrl();
+    // 사내 게이트웨이(예: seulgivibe)는 JWT를 Authorization: Bearer로 받기도 하고,
+    // transparent proxy로 헤더를 그대로 anthropic에 forward하기도 한다.
+    // 두 가지 모두 통과하도록 custom일 때 두 헤더 모두 보낸다. (공식 endpoint는 x-api-key만 보고 무시)
+    const isCustomGateway = anthropicBaseUrl !== "https://api.anthropic.com";
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": ANTHROPIC_API_VERSION,
+      "anthropic-dangerous-direct-browser-access": "true",
+    };
+    if (isCustomGateway) {
+      headers["Authorization"] = `Bearer ${apiKey}`;
+    }
+    const response = await fetch(buildAnthropicMessagesUrl(), {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": ANTHROPIC_API_VERSION,
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
+      headers,
       body: JSON.stringify({
         model,
         max_tokens: 4096,

@@ -132,14 +132,30 @@ function buildScenarioFromRecorded(
   const path = toPath(startUrl);
 
   const steps: Scenario["steps"] = [];
-  const addStep = (actionId: string, params: Record<string, any> = {}, description?: string) => {
-    const id = `s${steps.length + 1}`;
+  // 직전 step과 동일한 액션이라도 이 시간 이상 떨어졌으면 "의도된 별개 동작"으로 보고 추가한다.
+  // (예: 같은 "확인했어요" 모달이 연속으로 두 번 떠서 두 번 누르는 케이스)
+  // 이보다 짧으면 우발적 더블클릭/중복 이벤트로 보고 dedup.
+  const DEDUP_WINDOW_MS = 500;
+  let lastStepTs: number | null = null;
+  const addStep = (
+    actionId: string,
+    params: Record<string, any> = {},
+    description?: string,
+    ts?: number,
+  ) => {
     const prev = steps[steps.length - 1];
-    const next = { id, actionId, params, description };
-    if (prev && prev.actionId === next.actionId && JSON.stringify(prev.params || {}) === JSON.stringify(next.params || {})) {
-      return;
+    const isSameAsPrev =
+      prev &&
+      prev.actionId === actionId &&
+      JSON.stringify(prev.params || {}) === JSON.stringify(params || {});
+    if (isSameAsPrev) {
+      const withinWindow =
+        ts == null || lastStepTs == null || ts - lastStepTs < DEDUP_WINDOW_MS;
+      if (withinWindow) return;
     }
-    steps.push(next);
+    const id = `s${steps.length + 1}`;
+    steps.push({ id, actionId, params, description });
+    if (ts != null) lastStepTs = ts;
   };
 
   addStep("nav.goto", { url: path }, "현재 페이지로 이동합니다.");
@@ -161,7 +177,7 @@ function buildScenarioFromRecorded(
       if (isNavCausedByClick) return;
 
       const navPath = toPath(navUrl);
-      addStep("nav.goto", { url: navPath }, `${navPath} 페이지로 이동합니다.`);
+      addStep("nav.goto", { url: navPath }, `${navPath} 페이지로 이동합니다.`, log.ts);
       return;
     }
 
@@ -177,7 +193,7 @@ function buildScenarioFromRecorded(
       const clickDesc = clickText
         ? `${clickText} 버튼을 클릭합니다.`
         : `${clickSelector} 요소를 클릭합니다.`;
-      addStep("button.click", params, clickDesc);
+      addStep("button.click", params, clickDesc, log.ts);
       return;
     }
 
@@ -187,7 +203,7 @@ function buildScenarioFromRecorded(
       const x = Number(log.x);
       const params: Record<string, any> = { y: Math.max(0, Math.round(y)) };
       if (Number.isFinite(x) && x > 0) params.x = Math.round(x);
-      addStep("scroll.to", params, `페이지를 아래로 스크롤합니다. (y:${params.y})`);
+      addStep("scroll.to", params, `페이지를 아래로 스크롤합니다. (y:${params.y})`, log.ts);
       return;
     }
 
@@ -202,7 +218,7 @@ function buildScenarioFromRecorded(
       const fillDesc = label
         ? `${label} 값을 입력합니다.`
         : `${inputSelector} 필드에 값을 입력합니다.`;
-      addStep("form.fill", params, fillDesc);
+      addStep("form.fill", params, fillDesc, log.ts);
       return;
     }
 
@@ -217,7 +233,7 @@ function buildScenarioFromRecorded(
       const hoverDesc = hoverText
         ? `${hoverText} 요소에 마우스를 올립니다.`
         : `${hoverSelector} 요소에 마우스를 올립니다.`;
-      addStep("interaction.hover", params, hoverDesc);
+      addStep("interaction.hover", params, hoverDesc, log.ts);
       return;
     }
 
@@ -233,7 +249,7 @@ function buildScenarioFromRecorded(
       const selectDesc = selectLabel
         ? `${selectLabel}에서 ${log.optionText || log.value}을(를) 선택합니다.`
         : `${selectSelector}에서 값을 선택합니다.`;
-      addStep("form.select", params, selectDesc);
+      addStep("form.select", params, selectDesc, log.ts);
       return;
     }
 
@@ -263,7 +279,7 @@ function buildScenarioFromRecorded(
           ? `${chkLabel} 항목을 ${on ? "체크" : "해제"}합니다.`
           : `${chkSelector} 항목을 ${on ? "체크" : "해제"}합니다.`;
       })();
-      addStep("form.check", params, chkDesc);
+      addStep("form.check", params, chkDesc, log.ts);
       return;
     }
 
@@ -273,7 +289,7 @@ function buildScenarioFromRecorded(
       const keyLabel: Record<string, string> = { Enter: "엔터", Escape: "ESC", Tab: "탭" };
       const params: Record<string, any> = { key };
       if (log.selector) params.selector = log.selector;
-      addStep("keyboard.press", params, `${keyLabel[key] || key} 키를 입력합니다.`);
+      addStep("keyboard.press", params, `${keyLabel[key] || key} 키를 입력합니다.`, log.ts);
     }
   });
 

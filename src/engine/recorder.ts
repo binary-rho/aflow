@@ -264,10 +264,18 @@ const INJECT_SCRIPT = `
     var id = (el.id || '').trim();
     if (id) {
       var byFor = document.querySelector('label[for="' + id.replace(/"/g, '\\\\"') + '"]');
-      if (byFor) return norm(byFor.textContent || '');
+      if (byFor) {
+        // label 태그가 존재해도 안이 비어있을 수 있다(주민번호 뒷자리 등 Vue 컴포넌트가
+        // label을 placeholder로 대신 쓰는 패턴). 빈 결과면 다음 폴백으로 진행.
+        var byForText = norm(byFor.textContent || '');
+        if (byForText) return byForText;
+      }
     }
     var inLabel = el.closest('label');
-    if (inLabel) return norm(inLabel.textContent || '');
+    if (inLabel) {
+      var inLabelText = norm(inLabel.textContent || '');
+      if (inLabelText) return inLabelText;
+    }
     return norm(el.getAttribute('aria-label') || '')
       || norm(el.getAttribute('placeholder') || '')
       || norm(el.getAttribute('title') || '')
@@ -288,6 +296,13 @@ const INJECT_SCRIPT = `
   var CHECK_DEDUP_MS = 300;
 
   document.addEventListener('click', function(event) {
+    // input debounce가 펜딩 중일 때 사용자가 마우스로 다음 버튼/결과를 클릭하면
+    // 모달이 닫히거나 화면이 전환되며 input 이벤트가 손실된다.
+    // (예: 주소 검색 input → 검색 결과 클릭 → 모달 닫힘 → input step 누락)
+    // click 처리 전에 먼저 flush해서 input → click 순서로 항상 기록되게 한다.
+    // 펜딩이 없으면 noop이라 일반 click엔 영향 없음.
+    flushAllPendingInputs();
+
     var rawTarget = event.target instanceof Element ? event.target : null;
     if (!rawTarget) return;
 
@@ -367,29 +382,50 @@ const INJECT_SCRIPT = `
       var isCheckbox = (checkTarget instanceof HTMLInputElement && checkTarget.type === 'checkbox') || role === 'checkbox' || role === 'switch';
       var payload = {
         type: 'check',
-        label: chkLabel || chkSelector || '',
+        // label에는 진짜 텍스트만. chkLabel이 비었다고 selector 문자열(nth 체인 등)을
+        // 라벨로 넣으면 재생이 "그 selector 문자열을 텍스트로 가진 항목"을 찾아 실패한다.
+        label: chkLabel || '',
         selector: chkSelector,
         context: chkContext,
         ts: Date.now()
       };
-      // 커스텀 요소는 aria-checked로 상태를 읽는다(없으면 토글 후 상태 추정).
-      function readChecked(el) {
+      function readCurrentChecked(el) {
         if (el instanceof HTMLInputElement) return !!el.checked;
         var ac = el.getAttribute('aria-checked');
         if (ac === 'true') return true;
         if (ac === 'false') return false;
         return null;
       }
+      // capture 직후 el.checked는 토글 전. 그런데 setTimeout(0)도 Vue nextTick
+      // (microtask)보다 빠를 수 있어 여전히 토글 전이다. 짧은 폴링으로 토글이
+      // 일어날 때까지 기다린다(최대 ~100ms). 변하면 즉시 종료.
+      function awaitToggleThenSend(initial) {
+        var attempts = 0;
+        var MAX_ATTEMPTS = 10;
+        var INTERVAL_MS = 10;
+        function tick() {
+          var now = readCurrentChecked(checkTarget);
+          if (now !== initial || attempts >= MAX_ATTEMPTS) {
+            if (now === null) payload.clickOnly = true;
+            else payload.checked = now;
+            send(payload);
+            return;
+          }
+          attempts++;
+          setTimeout(tick, INTERVAL_MS);
+        }
+        setTimeout(tick, 0);
+      }
       if (isRadio) {
+        // 라디오 클릭=항상 선택. capture 시점과 무관하게 의도가 명확.
         payload.checked = true;
+        send(payload);
       } else if (isCheckbox) {
-        var st = readChecked(checkTarget);
-        if (st === null) payload.clickOnly = true;
-        else payload.checked = st;
+        awaitToggleThenSend(readCurrentChecked(checkTarget));
       } else {
         payload.clickOnly = true;
+        send(payload);
       }
-      send(payload);
       return;
     }
 
@@ -555,6 +591,41 @@ const INJECT_SCRIPT = `
     var context = el ? getContext(el) : null;
     send({ type: 'keypress', key: event.key, selector: selector, context: context, ts: Date.now() });
   }, true);
+
+  // 페이지 전환·탭 숨김 시 마지막 보루로 펜딩 input을 flush.
+  // SPA 라우팅/모달 닫힘으로 input 이벤트만 발생하고 blur/change 없이 사라지는 케이스 대비.
+  window.addEventListener('pagehide', flushAllPendingInputs, true);
+  document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'hidden') flushAllPendingInputs();
+  }, true);
+
+  // 한글 IME 조합 종료 시 펜딩 input을 즉시 flush.
+  // 일부 브라우저/IME 조합에서 keydown(Enter)이 compositionend보다 먼저 발화하면,
+  // flushAllPendingInputs 시점에 inputPending이 비어 input step이 손실된다.
+  // compositionend 후 짧은 마이크로 지연으로 최종 input 이벤트가 들어올 시간을 주고 flush.
+  document.addEventListener('compositionend', function(event) {
+    var target = event.target;
+    if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+    setTimeout(function() {
+      var selector = getSelector(target, { allowBrittle: true }) || '';
+      flushPendingInputForSelector(selector);
+    }, 0);
+  }, true);
+
+  // focusout 시 펜딩 input을 flush.
+  // maxlength 도달 시 Vue 컴포넌트가 자동으로 다음 input으로 focus() 옮기는 패턴(전화번호
+  // 뒷자리, 주민번호 뒷자리 등)에서는 click·change·keydown 모두 발생하지 않아 기존
+  // flush 경로를 못 탄다. focusout은 포커스가 다른 요소로 옮겨갈 때 항상 발생한다.
+  document.addEventListener('focusout', function(event) {
+    var target = event.target;
+    if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+    var selector = getSelector(target, { allowBrittle: true }) || '';
+    flushPendingInputForSelector(selector);
+  }, true);
+
+  // beforeinput도 안전망: 일부 SPA에서 contenteditable이나 커스텀 컴포넌트가
+  // native input 이벤트를 누락시키는 경우, beforeinput에서 값 변화를 감지해 펜딩에 올린다.
+  // (정상 input 이벤트가 또 오면 동일 selector라 덮어쓰기될 뿐 영향 없음)
 })();
 `;
 

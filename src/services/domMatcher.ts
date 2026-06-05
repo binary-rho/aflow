@@ -14,6 +14,8 @@ import {
 import {
   getLlmProvider,
   getApiKeyForProvider,
+  getLlmMatcherEnabled,
+  getAnthropicBaseUrl,
 } from "@/stores/settingsStore";
 import { textMatches, contextMatches } from "@/services/textMatch";
 import {
@@ -25,11 +27,59 @@ import {
 import { buildClientActiveScopeScript } from "@/services/scopeResolver";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
-const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_MESSAGES_PATH = "/v1/messages";
 const ANTHROPIC_API_VERSION = "2023-06-01";
 
-const OPENAI_MATCHER_MODEL = "gpt-4o";
+// 회사 방화벽이 api.anthropic.com을 직접 막는 경우, 설정에 사내 Anthropic 호환 게이트웨이
+// (예: https://seulgivibe.lgudax.cool/anthropic) base URL을 넣어 우회한다.
+function buildAnthropicMessagesUrl(): string {
+  return `${getAnthropicBaseUrl()}${ANTHROPIC_MESSAGES_PATH}`;
+}
+
+// 매처는 라벨/요소 식별이라는 단순 분류 작업이라 gpt-4o-mini로도 정확도 충분하고,
+// gpt-4o보다 가용성이 좋아 503/과부하 영향을 덜 받는다.
+// (시나리오 변환 LLM은 services/llm.ts에서 별도로 gpt-4o 유지)
+const OPENAI_MATCHER_MODEL = "gpt-4o-mini";
+// 사내 게이트웨이가 모델 가격 테이블에서 alias("sonnet")만으론 버전 특정을 못 해
+// "Model price not found"를 뱉는 경우가 있다. 풀 모델명으로 명시한다.
+// (Claude Code 모델 메뉴 기준: Sonnet=4.6, Haiku=4.5, Opus=4.8)
 const ANTHROPIC_MATCHER_MODEL = "claude-sonnet-4-6";
+
+// LLM 호출은 일시적 5xx/429(서버 과부하·rate limit)에서 자주 막히는데,
+// 시나리오 실행 도중 단발성 장애로 폴백 체인 전체가 끊기는 걸 막기 위해
+// 작은 백오프로 짧게 두 번까지 재시도한다. 4xx(인증·요청 오류)는 재시도 안 함.
+const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const LLM_RETRY_BACKOFF_MS = [400, 1200] as const;
+
+async function fetchLlmWithRetry(
+  input: RequestInfo,
+  init: RequestInit,
+): Promise<Response> {
+  const maxRetries = LLM_RETRY_BACKOFF_MS.length;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(input, init);
+      if (response.ok || !TRANSIENT_HTTP_STATUSES.has(response.status)) {
+        return response;
+      }
+      if (attempt >= maxRetries) return response;
+      console.warn(
+        `[flux] matcher API ${response.status} — retrying (${attempt + 1}/${maxRetries})`,
+      );
+    } catch (err) {
+      lastError = err;
+      if (attempt >= maxRetries) throw err;
+      console.warn(
+        `[flux] matcher API network error — retrying (${attempt + 1}/${maxRetries})`,
+      );
+    }
+    await new Promise((resolve) =>
+      setTimeout(resolve, LLM_RETRY_BACKOFF_MS[attempt]),
+    );
+  }
+  throw lastError ?? new Error("LLM fetch failed");
+}
 
 export interface ElementIntent {
   action: "button.click" | "form.fill";
@@ -112,6 +162,42 @@ function ctaToCandidate(c: PageSummaryPayload["ctas"][number]): ElementCandidate
 }
 function fieldToCandidate(f: PageSummaryPayload["formFields"][number]): ElementCandidate {
   return { selector: f.selector!, text: f.label ?? f.ariaLabel ?? f.placeholder ?? null, context: f.context ?? null };
+}
+
+// LLM 페이로드 축소: 의도(button.click vs form.fill)에 맞는 종류만 + 상위 N개만 보낸다.
+// intent 키워드와 매칭되는 항목을 앞쪽으로 정렬해 잘려도 정답이 살아남을 확률을 높인다.
+const MAX_SUMMARY_ITEMS_FOR_LLM = 30;
+
+function trimSummaryForIntent(
+  summary: PageSummaryPayload,
+  intent: ElementIntent,
+): PageSummaryPayload {
+  const isClick = intent.action === "button.click";
+  const isFill = intent.action === "form.fill";
+
+  let ctas = summary.ctas || [];
+  let formFields = summary.formFields || [];
+
+  if (isClick && intent.text) {
+    const target = intent.text.toLowerCase();
+    ctas = [...ctas].sort((a, b) => matchRank(a.text || a.accessibleName, target) - matchRank(b.text || b.accessibleName, target));
+  }
+  if (isFill && intent.label) {
+    const target = intent.label.toLowerCase();
+    formFields = [...formFields].sort((a, b) => matchRank(a.label || a.placeholder || a.name, target) - matchRank(b.label || b.placeholder || b.name, target));
+  }
+
+  return {
+    ...summary,
+    ctas: isClick ? ctas.slice(0, MAX_SUMMARY_ITEMS_FOR_LLM) : [],
+    formFields: isFill ? formFields.slice(0, MAX_SUMMARY_ITEMS_FOR_LLM) : [],
+  };
+}
+
+// 0(매칭), 1(미매칭). sort 시 매칭이 앞으로 온다.
+function matchRank(candidate: string | null | undefined, target: string): number {
+  if (!candidate) return 1;
+  return candidate.toLowerCase().includes(target) ? 0 : 1;
 }
 
 function tryCtaStrategies(
@@ -235,7 +321,11 @@ async function callMatcherLLM(
       .join("\n");
     domText = `candidates:\n${domText}`;
   } else {
-    domText = formatPageSummaryForLLM(summary);
+    // 전체 summary 폴백 시 페이로드를 의도에 맞게 가볍게 가공:
+    //   1) action별로 ctas/formFields 한쪽만 (button.click이면 formFields 불필요, 반대도 마찬가지)
+    //   2) 상위 30개로 제한 (회사 DLP가 본문 검사하는 환경에서 ~40KB는 차단됨)
+    //   3) intent text/label과 매칭되는 항목을 앞쪽으로 정렬해 잘려도 정답이 남게
+    domText = formatPageSummaryForLLM(trimSummaryForIntent(summary, intent));
   }
 
   const userMessage = `## Candidates / Page DOM:\n${domText}\n\n## Intent:\n${intentDesc}`;
@@ -259,14 +349,26 @@ async function callMatcherLLM(
 
   if (provider === "anthropic") {
     const anthropicKey = apiKey || getApiKeyForProvider("anthropic") || "";
-    const response = await fetch(ANTHROPIC_API_URL, {
+    const anthropicBaseUrl = getAnthropicBaseUrl();
+    // 사내 게이트웨이는 JWT를 Authorization: Bearer로, Anthropic 공식은 x-api-key로 받는다.
+    // custom base URL이면 두 헤더 모두 실어 어느 쪽 게이트웨이든 통과시키고,
+    // 공식이면 브라우저 직접 호출 허용 헤더를 붙인다.
+    const isCustomGateway = anthropicBaseUrl !== "https://api.anthropic.com";
+    // 사내 게이트웨이가 transparent proxy로 헤더를 그대로 anthropic에 forward하므로
+    // anthropic-dangerous-direct-browser-access는 항상 보낸다.
+    // (안 보내면 anthropic이 "CORS requests must set ..." 401 반환)
+    const anthropicHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      "x-api-key": anthropicKey,
+      "anthropic-version": ANTHROPIC_API_VERSION,
+      "anthropic-dangerous-direct-browser-access": "true",
+    };
+    if (isCustomGateway) {
+      anthropicHeaders["Authorization"] = `Bearer ${anthropicKey}`;
+    }
+    const response = await fetchLlmWithRetry(buildAnthropicMessagesUrl(), {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": anthropicKey,
-        "anthropic-version": ANTHROPIC_API_VERSION,
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
+      headers: anthropicHeaders,
       body: JSON.stringify({
         model: ANTHROPIC_MATCHER_MODEL,
         max_tokens: 200,
@@ -277,14 +379,17 @@ async function callMatcherLLM(
     });
 
     if (!response.ok) {
-      console.warn(`[flux] Anthropic matcher API error: ${response.status}`);
+      const bodyText = await response.text().catch(() => "");
+      console.warn(
+        `[flux] Anthropic matcher API error: ${response.status} | body: ${bodyText.slice(0, 800)}`,
+      );
       return { kind: "not_found" };
     }
 
     const data = await response.json();
     content = (data.content?.[0]?.text ?? "").trim();
   } else {
-    const response = await fetch(OPENAI_API_URL, {
+    const response = await fetchLlmWithRetry(OPENAI_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -302,7 +407,10 @@ async function callMatcherLLM(
     });
 
     if (!response.ok) {
-      console.warn(`[flux] OpenAI matcher API error: ${response.status}`);
+      const bodyText = await response.text().catch(() => "");
+      console.warn(
+        `[flux] OpenAI matcher API error: ${response.status} | body: ${bodyText.slice(0, 800)}`,
+      );
       return { kind: "not_found" };
     }
 
@@ -424,8 +532,13 @@ export async function resolveElement(
 
   const provider = llmProvider || getLlmProvider();
   const effectiveKey = apiKey || getApiKeyForProvider(provider as any) || "";
-  if (!effectiveKey) {
-    // AI 못 쓰면, 후보가 있을 때 첫 후보로 진행(애매 표시)
+  // 사내망 DLP가 매처 호출을 막아 매번 503으로 fallback될 때, 사용자가 명시적으로 끄면
+  // 재시도 시간(스텝당 ~3초) 낭비 없이 곧장 후보 기반 fallback으로 처리한다.
+  const matcherDisabled = !getLlmMatcherEnabled();
+  if (!effectiveKey || matcherDisabled) {
+    if (matcherDisabled) {
+      console.log("[flux] LLM matcher disabled — using code-based fallback only");
+    }
     if (fast.kind === "candidates" && fast.items.length > 0) {
       return { selector: fast.items[0].selector, matchedBy: "context-match", ambiguous: true, candidates: fast.items };
     }

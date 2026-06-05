@@ -7,6 +7,7 @@ import {
   isBrittleSelector,
   withScrollRetry,
 } from "@/services/targetResolver";
+import { resolveElement } from "@/services/domMatcher";
 import type { ActionFn } from "./index";
 
 export const clickButtonAction: ActionFn = async (tabId, params, options) => {
@@ -328,8 +329,34 @@ export const fillFormAction: ActionFn = async (tabId, params, options) => {
 };
 
 const CHECK_CLICK_SCRIPT = `
+// 체크/라디오 클릭 직전 분홍 하이라이트를 잠깐 그려, 무엇이 선택됐는지 눈에 보이게 한다.
+// 라디오 input 자체는 화면 밖/숨김인 경우가 많아, 보이는 라벨 쪽을 하이라이트한다.
+function fluxCheckHighlight(visibleEl) {
+  try {
+    if (!visibleEl) return;
+    var old = document.getElementById('__flux_highlight__');
+    if (old) old.remove();
+    var r = visibleEl.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return;
+    var ov = document.createElement('div');
+    ov.id = '__flux_highlight__';
+    ov.style.cssText = 'position:fixed;left:' + r.left + 'px;top:' + r.top +
+      'px;width:' + r.width + 'px;height:' + r.height +
+      'px;border:2px solid #ff2d78;border-radius:4px;background:rgba(255,45,120,0.15);' +
+      'pointer-events:none;z-index:2147483647;box-sizing:border-box;transition:opacity .3s;opacity:1;';
+    document.body.appendChild(ov);
+    setTimeout(function() { ov.style.opacity = '0'; setTimeout(function() { ov.remove(); }, 300); }, 450);
+  } catch (e) {}
+}
 function fluxCheckClick(el) {
   var isCheckable = el.matches('input[type="checkbox"], input[type="radio"]');
+  // 화면 밖(캐러셀 등)이면 끌어오고, 보이는 라벨을 하이라이트.
+  var lblForView = (isCheckable && el.id)
+    ? document.querySelector('label[for="' + el.id.replace(/"/g, '\\\\"') + '"]')
+    : (isCheckable ? el.closest('label') : null);
+  var viewTarget = lblForView || el;
+  try { viewTarget.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+  fluxCheckHighlight(viewTarget);
   if (isCheckable) {
     var isHidden = el.offsetParent === null ||
                    getComputedStyle(el).display === 'none' ||
@@ -347,11 +374,18 @@ function fluxCheckClick(el) {
   el.click();
 }`;
 
+/** label이 실제 텍스트가 아니라 CSS selector 문자열로 잘못 저장된 경우 걸러낸다. */
+function looksLikeSelector(s: unknown): boolean {
+  if (typeof s !== "string") return false;
+  return /:nth-(of-type|child)\(|^\s*[.#]|>\s|\[[\w-]+[=\]]/.test(s);
+}
+
 export const checkAction: ActionFn = async (tabId, params, options) => {
   const selector = params?.selector;
-  const label = params?.label;
+  // 과거 녹화에서 label에 selector 문자열이 박힌 데이터가 있어, 그런 label은 버린다.
+  const label = looksLikeSelector(params?.label) ? undefined : params?.label;
   const checked = params?.checked;
-  const context = params?.context;
+  const context = looksLikeSelector(params?.context) ? undefined : params?.context;
   /** true면 목표 checked 비교 없이 한 번만 클릭(실제 사용자 클릭과 동일한 토글) */
   const clickOnly = params?.clickOnly === true;
 
@@ -378,7 +412,15 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
         tabId,
         `(() => {
           ${CHECK_CLICK_SCRIPT}
-          var el = document.querySelector(${JSON.stringify(selector)});
+          var nodes = document.querySelectorAll(${JSON.stringify(selector)});
+          // selector가 모호(다수 매칭) + label이 있으면 label 매칭이 더 정확하다.
+          // 예: input[name="radio"]가 페이지에 12개 → 첫 매칭은 의도와 다를 가능성 큼.
+          // throw하면 catch에서 label 폴백(아래 if (label) 블록)으로 자연스럽게 넘어간다.
+          var hasLabel = ${JSON.stringify(Boolean(label))};
+          if (nodes.length > 1 && hasLabel) {
+            throw new Error('selector ambiguous (' + nodes.length + ' matches), falling back to label');
+          }
+          var el = nodes[0];
           if (!el) throw new Error('Element not found: ' + ${JSON.stringify(selector)});
           var clickOnly = ${JSON.stringify(clickOnly)};
           var wantChecked = ${JSON.stringify(checked)};
@@ -409,6 +451,7 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
   }
 
   if (label) {
+   try {
     await cdp.evaluate(
       tabId,
       `(() => {
@@ -497,11 +540,53 @@ export const checkAction: ActionFn = async (tabId, params, options) => {
 
         throw new Error('Checkbox/radio not found with label: ' + ${JSON.stringify(label)});
       })()`,
-    );
-    return;
+      );
+      return;
+    } catch (codeErr: any) {
+      // 코드 매칭(label) 실패 → 아래 AI 폴백으로 넘어간다.
+      console.warn(`[flux] check label matching failed, trying AI: ${codeErr?.message}`);
+    }
   }
 
-  throw new Error("form.check requires 'selector' or 'label'");
+  // ── AI 폴백 ──────────────────────────────────────────────
+  // selector·label 코드 매칭이 모두 실패했으면, 실행 시점 DOM을 캡처해 AI에게
+  // "이 의도에 맞는 요소"를 물어 그 selector를 클릭한다(모든 액션 공통 정책).
+  const intentText = (!looksLikeSelector(params?.label) && params?.label) || undefined;
+  if ((intentText || context) && options?.apiKey) {
+    const resolved = await resolveElement(
+      tabId,
+      {
+        action: "button.click",
+        text: intentText,
+        context: context ?? undefined,
+      },
+      options.apiKey,
+      options.llmProvider,
+    );
+    if (resolved) {
+      await cdp.evaluate(
+        tabId,
+        `(() => {
+          ${CHECK_CLICK_SCRIPT}
+          var el = document.querySelector(${JSON.stringify(resolved.selector)});
+          if (!el) throw new Error('AI-resolved element not found: ' + ${JSON.stringify(resolved.selector)});
+          fluxCheckClick(el);
+        })()`,
+      );
+      return {
+        strategy: resolved.matchedBy === "llm" ? "matcher-llm" : "matcher-fast-path",
+        selector: resolved.selector,
+        ambiguous: resolved.ambiguous,
+        candidates: resolved.candidates,
+      };
+    }
+  }
+
+  throw new Error(
+    label
+      ? `Checkbox/radio not found with label "${label}" (code + AI both failed)`
+      : "form.check requires 'selector' or 'label'",
+  );
 };
 
 export const keypressAction: ActionFn = async (tabId, params, options) => {

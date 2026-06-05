@@ -188,22 +188,34 @@ const attachedTabRefCount = new Map<number, number>();
 // ── networkidle 추적 ──────────────────────────────────────────────
 // 버튼 클릭 → API 호출 → 응답 → DOM 갱신 흐름에서, DOM이 조용한 시점을 "완료"로
 // 오판하지 않도록 진행 중(in-flight) 네트워크 요청 수를 tabId별로 센다.
-const inFlightRequests = new Map<number, Set<string>>();
+// requestId → 시작시각. 완료 이벤트를 놓친 stale 요청(페이지 전환 등)이 카운터를
+// 영원히 0이 안 되게 만드는 것을 막기 위해 시각을 들고 있다가 오래된 건 청소한다.
+const inFlightRequests = new Map<number, Map<string, number>>();
 let networkEventListenerRegistered = false;
 
-function bumpRequest(tabId: number, requestId: string, delta: 1 | -1): void {
-  let set = inFlightRequests.get(tabId);
-  if (!set) {
+// 이 시간(ms)보다 오래 끝나지 않은 요청은 "끝난 것으로 간주"하고 카운트에서 제외.
+// SSE/롱폴링/스트리밍이나 완료 이벤트 누락으로 카운터가 안 빠지는 것을 방어.
+const REQUEST_STALE_MS = 4000;
+
+function bumpRequest(tabId: number, requestId: string, delta: 1 | -1, now: number): void {
+  let m = inFlightRequests.get(tabId);
+  if (!m) {
     if (delta < 0) return;
-    set = new Set();
-    inFlightRequests.set(tabId, set);
+    m = new Map();
+    inFlightRequests.set(tabId, m);
   }
-  if (delta > 0) set.add(requestId);
-  else set.delete(requestId);
+  if (delta > 0) m.set(requestId, now);
+  else m.delete(requestId);
 }
 
-function getInFlightCount(tabId: number): number {
-  return inFlightRequests.get(tabId)?.size ?? 0;
+function getInFlightCount(tabId: number, now: number): number {
+  const m = inFlightRequests.get(tabId);
+  if (!m) return 0;
+  // stale 요청 청소
+  for (const [id, started] of m) {
+    if (now - started > REQUEST_STALE_MS) m.delete(id);
+  }
+  return m.size;
 }
 
 function ensureNetworkEventListener(): void {
@@ -215,12 +227,12 @@ function ensureNetworkEventListener(): void {
     const reqId = params?.requestId;
     if (!reqId) return;
     if (method === "Network.requestWillBeSent") {
-      bumpRequest(tabId, reqId, 1);
+      bumpRequest(tabId, reqId, 1, Date.now());
     } else if (
       method === "Network.loadingFinished" ||
       method === "Network.loadingFailed"
     ) {
-      bumpRequest(tabId, reqId, -1);
+      bumpRequest(tabId, reqId, -1, Date.now());
     }
   });
 }
@@ -259,10 +271,10 @@ export async function attachToTab(tabId: number): Promise<void> {
   });
 }
 
-/** networkidle용 Network 도메인 enable + in-flight Set 초기화. attach 직후 호출. */
+/** networkidle용 Network 도메인 enable + in-flight 맵 초기화. attach 직후 호출. */
 function enableNetworkTracking(tabId: number): void {
   ensureNetworkEventListener();
-  inFlightRequests.set(tabId, new Set());
+  inFlightRequests.set(tabId, new Map());
   // best-effort: enable 실패해도 다른 기능은 동작해야 하므로 에러 무시
   sendCommand(tabId, "Network.enable", {}).catch(() => {});
 }
@@ -396,24 +408,51 @@ const READY_POLL_MS = 80;
 const READY_DOM_QUIET_MS = 200;
 const READY_MAX_WAIT_MS = 15000;
 
-// networkidle: in-flight 요청이 0인 상태가 NETWORK_IDLE_MS 동안 유지되면 "네트워크 안정"으로 간주
-const NETWORK_IDLE_MS = 500;
+// networkidle: in-flight 요청이 0인 상태가 idleMs 동안 유지되면 "네트워크 안정"으로 간주
 const NETWORK_IDLE_POLL_MS = 100;
-const NETWORK_IDLE_MAX_WAIT_MS = 15000;
+// 새 페이지가 분석/폴링 요청을 계속 날리면 in-flight가 0이 안 될 수 있으므로 상한을 둔다.
+// 상한에 걸려도 다음 단계(DOM quiet)가 있으니 안전. 길면 "이미 넘어왔는데 안 끝남"이 된다.
+const NETWORK_IDLE_MAX_WAIT_MS = 4000;
 
 /**
- * 진행 중인 네트워크 요청이 0인 상태가 NETWORK_IDLE_MS 동안 이어질 때까지 대기.
- * 버튼 클릭 후 API 응답이 끝나고 화면이 갱신될 시간을 벌어준다.
- * Network 추적이 비활성(미attach 등)이면 즉시 반환한다.
+ * 액션 후 "안정될 때까지" 대기 강도 프로파일. 속도 프리셋(fast/normal/slow)에 연동.
+ * - changeStartMs: 액션 직후 DOM 변화 시작을 이만큼 기다림(0이면 변화 시작 대기 생략).
+ * - networkIdleMs: in-flight 0 상태가 이만큼 유지되면 네트워크 안정으로 판단.
+ * - domQuietMs: DOM 변경이 이만큼 없으면 렌더 완료로 판단.
+ * - skipNetworkIdle: true면 networkidle 단계 생략(가장 빠름).
  */
-export async function waitForNetworkIdle(tabId: number): Promise<void> {
+export interface WaitProfile {
+  changeStartMs: number;
+  networkIdleMs: number;
+  domQuietMs: number;
+  skipNetworkIdle?: boolean;
+}
+
+export const WAIT_PROFILES: Record<"fast" | "normal" | "slow", WaitProfile> = {
+  fast: { changeStartMs: 0, networkIdleMs: 250, domQuietMs: 100 },
+  normal: { changeStartMs: 350, networkIdleMs: 450, domQuietMs: 180 },
+  slow: { changeStartMs: 900, networkIdleMs: 700, domQuietMs: 280 },
+};
+
+/**
+ * 진행 중인 네트워크 요청이 0인 상태가 idleMs 동안 이어질 때까지 대기.
+ * 버튼 클릭 후 API 응답이 끝나고 화면이 갱신될 시간을 벌어준다.
+ * 한 번이라도 요청이 떴다 사라지면 거기서 종료(불필요하게 idleMs를 더 안 기다림).
+ * Network 추적이 비활성(미attach 등)이거나 처음부터 요청이 없으면 즉시 반환한다.
+ */
+export async function waitForNetworkIdle(
+  tabId: number,
+  idleMs: number = 450,
+): Promise<void> {
   if (!inFlightRequests.has(tabId)) return;
+  // 처음부터 in-flight가 0이면(네트워크 안 타는 액션) 바로 반환 — 헛되이 idleMs 안 기다림.
+  if (getInFlightCount(tabId, Date.now()) === 0) return;
   const deadline = Date.now() + NETWORK_IDLE_MAX_WAIT_MS;
   let idleSince: number | null = null;
   while (Date.now() < deadline) {
-    if (getInFlightCount(tabId) === 0) {
+    if (getInFlightCount(tabId, Date.now()) === 0) {
       if (idleSince == null) idleSince = Date.now();
-      if (Date.now() - idleSince >= NETWORK_IDLE_MS) return;
+      if (Date.now() - idleSince >= idleMs) return;
     } else {
       idleSince = null;
     }
@@ -421,24 +460,22 @@ export async function waitForNetworkIdle(tabId: number): Promise<void> {
   }
 }
 
-// expectChange 모드에서, 액션 직후 첫 DOM 변화(로딩 시작)를 이만큼 기다린다.
-// 그 안에 변화가 없으면(이미 끝났거나 변화 없는 액션) 그냥 통과해 무한 대기를 막는다.
-const READY_CHANGE_START_MS = 1200;
-
 /**
  * 문서 로드 완료 후, DOM이 더 이상 바뀌지 않을 때까지 대기(실제 렌더 안정).
  * - document.readyState === 'complete'|'interactive' 일 때까지 폴링
- * - MutationObserver로 DOM 변경 감지 후, 변경이 READY_DOM_QUIET_MS 동안 없으면 "렌더 완료"로 간주
+ * - MutationObserver로 DOM 변경 감지 후, quietMs 동안 변경 없으면 "렌더 완료"로 간주
  *
- * @param opts.expectChange true면 액션 직후 호출용 — "변화 시작"을 먼저 기다린 뒤 quiet 판정.
- *   클릭 → (로딩 스피너/네트워크) → 결과 흐름에서 변화가 시작되기도 전에 "조용함=완료"로
- *   오판하는 것을 막는다. 변화가 READY_CHANGE_START_MS 안에 없으면 통과.
+ * @param opts.quietMs DOM이 조용해야 하는 시간(기본 READY_DOM_QUIET_MS).
+ * @param opts.changeStartMs >0이면 "변화 시작"을 먼저 기다린 뒤 quiet 판정(액션 직후용).
+ *   변화가 changeStartMs 안에 없으면 통과(변화 없는 액션에서 헛대기 방지).
+ *   0이면 변화 시작 대기 없이 바로 quiet만 본다(가장 빠름).
  */
 export async function waitForPageReady(
   tabId: number,
-  opts?: { expectChange?: boolean },
+  opts?: { quietMs?: number; changeStartMs?: number },
 ): Promise<void> {
-  const expectChange = opts?.expectChange ?? false;
+  const quietMs = opts?.quietMs ?? READY_DOM_QUIET_MS;
+  const changeStartMs = opts?.changeStartMs ?? 0;
   const deadline = Date.now() + READY_MAX_WAIT_MS;
   while (Date.now() < deadline) {
     try {
@@ -450,9 +487,8 @@ export async function waitForPageReady(
       await evaluate(
         tabId,
         `new Promise(function(resolve) {
-          var quietMs = ${READY_DOM_QUIET_MS};
-          var expectChange = ${expectChange ? "true" : "false"};
-          var changeStartMs = ${READY_CHANGE_START_MS};
+          var quietMs = ${quietMs};
+          var changeStartMs = ${changeStartMs};
           var timer = null;
           var changed = false;
           var done = function() {
@@ -468,14 +504,11 @@ export async function waitForPageReady(
           var root = document.documentElement || document.body;
           if (!root) { resolve(); return; }
           observer.observe(root, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            characterData: true
+            childList: true, subtree: true, attributes: true, characterData: true
           });
-          if (expectChange) {
-            // 변화가 시작되면 위 observer가 quiet 타이머를 건다.
-            // changeStartMs 안에 아무 변화도 없으면(이미 끝났거나 변화 없는 액션) 통과.
+          if (changeStartMs > 0) {
+            // 변화가 시작되면 observer가 quiet 타이머를 건다.
+            // changeStartMs 안에 아무 변화도 없으면 통과.
             timer = setTimeout(function() { if (!changed) done(); }, changeStartMs);
           } else {
             timer = setTimeout(done, quietMs);
@@ -486,6 +519,28 @@ export async function waitForPageReady(
     } catch {
       await sleep(READY_POLL_MS);
     }
+  }
+}
+
+/**
+ * 액션 직후 "화면이 안정될 때까지" 한 번에 대기. (변화시작 → networkidle → DOM quiet)
+ * 기존에 waitForPageReady를 3번 호출하던 것을 이 하나로 통합해 중복 대기를 없앤다.
+ * profile로 강도를 조절(fast는 변화시작 생략, idle/quiet 짧게).
+ */
+export async function waitForSettled(
+  tabId: number,
+  profile: WaitProfile,
+): Promise<void> {
+  // 1) 변화 시작 + DOM quiet (changeStartMs=0이면 변화 대기 없이 바로 quiet)
+  await waitForPageReady(tabId, {
+    quietMs: profile.domQuietMs,
+    changeStartMs: profile.changeStartMs,
+  });
+  // 2) 네트워크가 떴으면 잦아들 때까지(안 떴으면 즉시 반환)
+  if (!profile.skipNetworkIdle) {
+    await waitForNetworkIdle(tabId, profile.networkIdleMs);
+    // 네트워크 응답으로 새 렌더가 생겼을 수 있으니 마지막으로 짧게 안정 확인
+    await waitForPageReady(tabId, { quietMs: profile.domQuietMs, changeStartMs: 0 });
   }
 }
 

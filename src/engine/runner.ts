@@ -1,9 +1,17 @@
 import * as cdp from "./cdp";
+import { WAIT_PROFILES, type WaitProfile } from "./cdp";
 import { executeAction, type StepResult } from "./actionRegistry";
 import type { Scenario } from "@/app/data";
 import { getScenarioEffectiveUrl, isSamePage } from "@/services/urlMatch";
 
 const DEFAULT_STEP_DELAY_MS = 300;
+
+/** stepDelay 값으로 대기 프로파일을 고른다(프리셋: fast=200, normal=1000, slow=3000). */
+function waitProfileForDelay(stepDelayMs: number): WaitProfile {
+  if (stepDelayMs <= 300) return WAIT_PROFILES.fast;
+  if (stepDelayMs >= 2000) return WAIT_PROFILES.slow;
+  return WAIT_PROFILES.normal;
+}
 
 export type RunnerStatus = "idle" | "running" | "paused" | "done" | "error";
 
@@ -93,6 +101,7 @@ export async function runScenario(
   isPaused = false;
   const results: StepResult[] = [];
   const stepDelayMs = options?.stepDelayMs ?? DEFAULT_STEP_DELAY_MS;
+  const waitProfile = waitProfileForDelay(stepDelayMs);
   let startFromIndex = options?.startFromIndex ?? 0;
   const firstStep = scenario.steps[0];
   if (firstStep?.actionId === "nav.goto" && startFromIndex === 0) {
@@ -126,11 +135,13 @@ export async function runScenario(
 
   const onTabCreated = (tab: chrome.tabs.Tab) => {
     if (tab.id == null) return;
-    const isFromCurrentTab = tab.openerTabId === currentTabId;
-    const isUnknown = !knownTabIds.has(tab.id);
-    if (isFromCurrentTab || isUnknown) {
+    knownTabIds.add(tab.id);
+    // opener가 현재 탭일 때만 "시나리오 관련 새 탭"으로 간주.
+    // isUnknown(=시나리오 시작 후 생긴 모든 탭)으로 잡으면 광고 popup, 외부 SDK,
+    // 사용자가 백그라운드에서 직접 연 탭까지 휩쓸려 currentTabId가 엉뚱하게 옮겨간다.
+    // (실제 사례: 인증 모달은 메인 탭에 있는데 클릭만 무관한 탭에서 일어나 "성공"으로 마크됨)
+    if (tab.openerTabId === currentTabId) {
       pendingNewTabId = tab.id;
-      knownTabIds.add(tab.id);
     }
   };
   chrome.tabs.onCreated.addListener(onTabCreated);
@@ -200,7 +211,8 @@ export async function runScenario(
       const step = scenario.steps[i];
       onStatus(buildState(scenario, "running", i, results));
 
-      await cdp.waitForPageReady(currentTabId);
+      // 액션 전엔 보통 이미 안정 상태 → 가볍게만 확인(직전 waitForSettled가 안정시켜둠).
+      await cdp.waitForPageReady(currentTabId, { quietMs: waitProfile.domQuietMs });
 
       const result = await executeAction(currentTabId, step.actionId, step.params, {
         validationOnly: options?.validationOnly,
@@ -214,11 +226,9 @@ export async function runScenario(
         return false;
       }
 
-      // 액션 직후: 변화 시작을 먼저 기다리고(expectChange), 네트워크가 잦아들 때까지,
-      // 그 다음 DOM이 안정될 때까지 대기. "API로 늦게 뜨는 화면을 빨리 지나감" 방지.
-      await cdp.waitForPageReady(currentTabId, { expectChange: true });
-      await cdp.waitForNetworkIdle(currentTabId);
-      await cdp.waitForPageReady(currentTabId);
+      // 액션 직후: 화면이 안정될 때까지 한 번에 대기(변화시작 → networkidle → DOM quiet).
+      // 강도는 속도 프리셋에 연동 — fast면 가볍게, slow면 꼼꼼히.
+      await cdp.waitForSettled(currentTabId, waitProfile);
       await sleep(stepDelayMs);
 
       await switchToNewTabIfNeeded();
