@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from "react";
+import React, { useState, useCallback, useEffect, useMemo } from "react";
 import { useSearchParams, Link } from "react-router";
 import {
   Globe,
@@ -20,6 +20,7 @@ import { Layout } from "../components/Layout";
 import { Section } from "../components/Section";
 import { DrrInputBox } from "../components/DrrInputBox";
 import { DrrResultView } from "../components/DrrResultView";
+import { DrrThinkingView } from "../components/DrrThinkingView";
 import { Button } from "../components/ui/button";
 import {
   DropdownMenu,
@@ -40,7 +41,7 @@ import {
   getInspectedPageSummary,
   formatPageSummaryForLLM,
 } from "@/services/domSnapshot";
-import { getApiKey } from "@/stores/settingsStore";
+import { getApiKey, getLlmProvider } from "@/stores/settingsStore";
 import { getActiveTabId } from "@/hooks/useActiveTabId";
 import { buildScenarioRunChain } from "@/lib/scenarioChain";
 import {
@@ -53,11 +54,19 @@ import { useInspectedTabUrl } from "@/hooks/useInspectedTabUrl";
 import {
   scenarioMatchesInspectedHost,
   resolveUrlPatternFromDsl,
+  normalizeScenarioHost,
 } from "@/lib/scenarioHost";
 import {
   normalizeUrlForCompare,
   getScenarioEffectiveUrl,
 } from "@/services/urlMatch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/app/components/ui/select";
 
 type TabId = "all" | "current" | string;
 
@@ -121,9 +130,25 @@ export default function ScenarioList() {
 
   const { currentDomain, currentFullUrl } = useInspectedTabUrl();
 
+  /** 도메인 셀렉트로 이동을 요청한 직후, 폴링이 반영되기 전까지 쓰는 낙관적 도메인 */
+  const [pendingDomain, setPendingDomain] = useState<string | null>(null);
+
+  /** 목록 필터·셀렉트 표시의 기준 도메인 (이동 직후엔 pendingDomain 우선) */
+  const effectiveDomain = pendingDomain ?? currentDomain;
+
+  useEffect(() => {
+    if (pendingDomain && normalizeScenarioHost(currentDomain) === pendingDomain) {
+      setPendingDomain(null);
+    }
+  }, [currentDomain, pendingDomain]);
+
   const [drrInput, setDrrInput] = useState("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [drrResult, setDrrResult] = useState<string | null>(null);
+  /** 변환 중 스트리밍되는 LLM 추론(reasoning) (입력창 자리에 실시간 표시) */
+  const [streamingReasoning, setStreamingReasoning] = useState("");
+  /** 진행 중인 변환 요청을 취소하기 위한 컨트롤러 */
+  const analyzeAbortRef = React.useRef<AbortController | null>(null);
 
   /** 카드에서 '검증' 클릭 시 실행 페이지로 가지 않고 여기서 결과만 토스트로 표시 */
   const [validationToast, setValidationToast] = useState<{
@@ -265,8 +290,31 @@ export default function ScenarioList() {
 
   /** 현재 검사 탭 호스트와 urlPattern이 맞는 시나리오 (「전체」 탭 목록) */
   const domainScenarios = scenarios.filter((s) =>
-    scenarioMatchesInspectedHost(s.urlPattern, currentDomain),
+    scenarioMatchesInspectedHost(s.urlPattern, effectiveDomain),
   );
+
+  /** 저장된 시나리오 호스트 ∪ 현재 도메인 (셀렉트 옵션) */
+  const availableDomains = useMemo(() => {
+    const set = new Set<string>();
+    for (const s of scenarios) {
+      const h = normalizeScenarioHost(s.urlPattern.split("/")[0]);
+      if (h && h !== "localhost") set.add(h);
+    }
+    const cur = normalizeScenarioHost(effectiveDomain);
+    if (cur && cur !== "localhost") set.add(cur);
+    return Array.from(set).sort();
+  }, [scenarios, effectiveDomain]);
+
+  const handleSelectDomain = useCallback((host: string) => {
+    setPendingDomain(normalizeScenarioHost(host));
+    setActiveTab("all");
+    try {
+      chrome.runtime.sendMessage({
+        type: "NAVIGATE_ACTIVE_TAB",
+        url: `https://${host}/`,
+      });
+    } catch {}
+  }, [setActiveTab]);
 
   const getFirstDepth = (fullUrl: string) => {
     const slashIdx = fullUrl.indexOf("/");
@@ -402,26 +450,41 @@ export default function ScenarioList() {
   const handleAnalyzeDRR = async () => {
     if (!drrInput.trim()) return;
     setIsAnalyzing(true);
+    setStreamingReasoning("");
+    const abortController = new AbortController();
+    analyzeAbortRef.current = abortController;
     try {
       const apiKey = getApiKey();
-      if (!apiKey) {
-        alert("설정에서 OpenAI API 키를 먼저 입력해주세요.");
+      // 로컬 LLM은 키 없이 열린 서버가 많아 키를 필수로 요구하지 않는다.
+      if (!apiKey && getLlmProvider() !== "local") {
+        alert("설정에서 API 키를 먼저 입력해주세요.");
         return;
       }
       const currentPageSummary = await getInspectedPageSummary();
       const pageSummary = currentPageSummary
         ? `## 현재 페이지\n${formatPageSummaryForLLM(currentPageSummary)}`
         : null;
-      const dsl = await generateDSL(drrInput, apiKey, {
+      const dsl = await generateDSL(drrInput, apiKey ?? "", {
         pageSummary,
         currentHost: currentDomain || undefined,
+        onReasoning: (full) => setStreamingReasoning(full),
+        signal: abortController.signal,
       });
       setDrrResult(JSON.stringify(dsl, null, 2));
     } catch (err: any) {
-      alert(`변환 실패: ${err.message}`);
+      // 사용자가 취소한 경우(AbortError)는 조용히 입력창으로 복귀한다.
+      if (err?.name !== "AbortError") {
+        alert(`변환 실패: ${err.message}`);
+      }
     } finally {
+      analyzeAbortRef.current = null;
       setIsAnalyzing(false);
+      setStreamingReasoning("");
     }
+  };
+
+  const handleCancelAnalyze = () => {
+    analyzeAbortRef.current?.abort();
   };
 
   const handleSaveDRR = () => {
@@ -599,12 +662,21 @@ export default function ScenarioList() {
         <div className="flex flex-col min-h-0 flex-1 w-full max-w-full h-full pb-safe px-0">
           <div className="bg-white/95 backdrop-blur-md border-b border-[var(--flux-border-light)] px-3 py-2.5 flex items-center gap-2 text-xs text-[var(--flux-text-muted)] shrink-0 z-30 transition-all mb-1 shadow-sm min-w-0">
             <Globe className="w-3.5 h-3.5 text-[var(--flux-primary)] shrink-0" />
-            <span
-              className="text-[var(--flux-text-default)] font-mono text-xs font-medium truncate min-w-0"
-              title={currentDomain}
-            >
-              {currentDomain}
-            </span>
+            <Select value={effectiveDomain} onValueChange={handleSelectDomain}>
+              <SelectTrigger
+                className="h-auto min-w-0 flex-1 border-0 bg-transparent p-0 shadow-none text-[var(--flux-text-default)] font-mono text-xs font-medium focus:ring-0"
+                title="로컬에 저장된 사이트로 이동"
+              >
+                <SelectValue className="truncate" />
+              </SelectTrigger>
+              <SelectContent>
+                {availableDomains.map((host) => (
+                  <SelectItem key={host} value={host} className="font-mono text-xs">
+                    {host}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
           <Section
@@ -631,22 +703,33 @@ export default function ScenarioList() {
             }
           >
             <div className="flex flex-col gap-0">
-              {!drrResult ? (
-                <>
+              {(() => {
+                if (drrResult) {
+                  return (
+                    <DrrResultView
+                      result={drrResult}
+                      onCancel={() => setDrrResult(null)}
+                      onSave={handleSaveDRR}
+                    />
+                  );
+                }
+                if (isAnalyzing) {
+                  return (
+                    <DrrThinkingView
+                      text={streamingReasoning}
+                      onCancel={handleCancelAnalyze}
+                    />
+                  );
+                }
+                return (
                   <DrrInputBox
                     value={drrInput}
                     onChange={setDrrInput}
                     onConvert={handleAnalyzeDRR}
                     isAnalyzing={isAnalyzing}
                   />
-                </>
-              ) : (
-                <DrrResultView
-                  result={drrResult}
-                  onCancel={() => setDrrResult(null)}
-                  onSave={handleSaveDRR}
-                />
-              )}
+                );
+              })()}
             </div>
           </Section>
 
@@ -670,7 +753,7 @@ export default function ScenarioList() {
                 <button
                   type="button"
                   onClick={() => setActiveTab("all")}
-                  title={`검사 중 탭과 urlPattern이 맞는 시나리오 (${currentDomain || "…"})`}
+                  title={`검사 중 탭과 urlPattern이 맞는 시나리오 (${effectiveDomain || "…"})`}
                   className={`px-2.5 py-1 rounded-md text-[11px] font-bold transition-colors border ${
                     activeTab === "all"
                       ? "bg-[var(--flux-primary)] text-white border-[var(--flux-primary)]"
@@ -699,7 +782,7 @@ export default function ScenarioList() {
                       : "bg-white text-[var(--flux-text-muted)] border-[var(--flux-border)] hover:border-[var(--flux-primary)] hover:text-[var(--flux-primary)]"
                   }`}
                 >
-                  플로우
+                  조합시나리오
                 </button>
                 {groups.map((g) => (
                   <div
@@ -746,7 +829,7 @@ export default function ScenarioList() {
                   type="text"
                   placeholder={
                     activeTab === "flows"
-                      ? "플로우 이름 검색..."
+                      ? "조합시나리오 이름 검색..."
                       : "제목, 태그 검색..."
                   }
                   className="w-full pl-9 pr-3 py-2 bg-[var(--flux-bg-subtle)] border border-[var(--flux-border)] focus:bg-white focus:border-[var(--flux-primary)] focus:ring-2 focus:ring-[var(--flux-ring)] rounded-lg text-xs transition-all outline-none placeholder:text-[var(--flux-text-muted)]"
@@ -882,7 +965,7 @@ export default function ScenarioList() {
                       <span className="whitespace-pre-line">
                         {searchTerm
                           ? "검색 결과가 없습니다."
-                          : "저장된 플로우가 없습니다.\n우측 상단 '플로우 만들기'를 눌러 시나리오를 조합해보세요."}
+                          : "저장된 조합시나리오가 없습니다.\n우측 상단 '시나리오 조합'을 눌러 시나리오를 조합해보세요."}
                       </span>
                     </div>
                   )}

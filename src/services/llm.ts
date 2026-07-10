@@ -3,9 +3,12 @@ import {
   getLlmProvider,
   LLM_PROVIDER_OPTIONS,
   getAnthropicBaseUrl,
+  getLocalBaseUrl,
+  getLocalModel,
 } from "@/stores/settingsStore";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_CHAT_PATH = "/v1/chat/completions";
 const ANTHROPIC_MESSAGES_PATH = "/v1/messages";
 const ANTHROPIC_API_VERSION = "2023-06-01";
 
@@ -13,6 +16,11 @@ const ANTHROPIC_API_VERSION = "2023-06-01";
 // 게이트웨이 base URL을 넣어 우회한다. domMatcher와 동일한 정책으로 처리.
 function buildAnthropicMessagesUrl(): string {
   return `${getAnthropicBaseUrl()}${ANTHROPIC_MESSAGES_PATH}`;
+}
+
+// 로컬 LLM은 OpenAI 호환 /v1/chat/completions 를 재사용한다. base URL만 로컬 주소로 바뀐다.
+function buildLocalChatUrl(): string {
+  return `${getLocalBaseUrl()}${OPENAI_CHAT_PATH}`;
 }
 
 function buildActionCatalog(): string {
@@ -326,6 +334,114 @@ function extractDomainToken(drrText: string): string | null {
   return null;
 }
 
+/**
+ * LLM 응답을 DSL JSON으로 파싱한다. 로컬 모델은 JSON 앞뒤에 산문("여기 결과입니다:" 등)을
+ * 붙이는 경우가 있어, 그대로 파싱이 실패하면 첫 '{' ~ 마지막 '}' 구간만 잘라 재시도한다.
+ */
+/**
+ * OpenAI 호환 /v1/chat/completions 의 스트림을 소비한다. SSE(data: …)와 NDJSON(줄마다 JSON) 모두 지원.
+ * - reasoning / reasoning_content(추론 과정)는 누적해 onReasoning 으로 실시간 콜백.
+ * - content(최종 JSON)는 화면에 흘리지 않고 조용히 누적만 한다.
+ * content 와 reasoning 을 함께 반환한다(서버가 content를 비우고 reasoning에만 답을 넣는 경우 대비).
+ */
+async function consumeOpenAiStream(
+  stream: ReadableStream<Uint8Array>,
+  onReasoning: (fullReasoning: string, delta: string) => void,
+): Promise<{ content: string; reasoning: string }> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let reasoning = "";
+
+  const handleChunkJson = (payload: string) => {
+    if (!payload || payload === "[DONE]") return;
+    let json: any;
+    try {
+      json = JSON.parse(payload);
+    } catch {
+      return; // 불완전/비표준 청크는 건너뛴다.
+    }
+    // OpenAI 스트림은 choices[].delta, 일부 서버(NDJSON)는 choices[].message 또는 message.
+    const choice = json.choices?.[0];
+    const node = choice?.delta ?? choice?.message ?? json.message ?? {};
+
+    const reasoningDelta: string =
+      node.reasoning ?? node.reasoning_content ?? "";
+    if (reasoningDelta) {
+      reasoning += reasoningDelta;
+      onReasoning(reasoning, reasoningDelta);
+    }
+    const contentDelta: string = node.content ?? "";
+    if (contentDelta) {
+      content += contentDelta;
+    }
+  };
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // 이벤트는 개행으로 구분된다. 마지막 불완전 라인은 버퍼에 남긴다.
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim(); // \r(CRLF) 제거 포함
+        if (!line) continue;
+        // SSE면 "data:" prefix를 벗기고, NDJSON이면 그대로 JSON으로 시도한다.
+        const payload = line.startsWith("data:")
+          ? line.slice("data:".length).trim()
+          : line;
+        handleChunkJson(payload);
+      }
+    }
+    // 스트림 종료 시 버퍼에 남은 마지막 라인도 처리한다.
+    if (buffer.trim()) {
+      const line = buffer.trim();
+      handleChunkJson(line.startsWith("data:") ? line.slice("data:".length).trim() : line);
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+
+  if (import.meta.env?.DEV) {
+    console.debug(
+      `[flux] stream done — content ${content.length}자, reasoning ${reasoning.length}자`,
+    );
+  }
+
+  return { content, reasoning };
+}
+
+/** 추론 모델이 붙이는 <think>…</think> 블록(닫히지 않은 경우 포함)을 제거한다. */
+function stripThinkBlocks(text: string): string {
+  const closed = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  // 닫는 태그 없이 <think> 만 남은 경우, 그 이후 전부를 thinking 으로 보고 잘라낸다.
+  const openIdx = closed.search(/<think>/i);
+  if (openIdx >= 0) {
+    return closed.slice(0, openIdx);
+  }
+  return closed;
+}
+
+function parseDslJson(cleaned: string): DSL {
+  try {
+    return JSON.parse(cleaned);
+  } catch (firstError) {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      return JSON.parse(cleaned.slice(start, end + 1));
+    }
+    throw firstError;
+  }
+}
+
 const MAX_PAGE_SUMMARY_CHARS = 200_000;
 
 function truncatePageSummary(summary: string): string {
@@ -339,7 +455,14 @@ function truncatePageSummary(summary: string): string {
 export async function generateDSL(
   drrText: string,
   apiKey: string,
-  options?: { pageSummary?: string | null; currentHost?: string | null },
+  options?: {
+    pageSummary?: string | null;
+    currentHost?: string | null;
+    /** 있으면 OpenAI 호환(local/openai) 경로를 스트리밍으로 실행하고, 추론(reasoning)이 올 때마다 호출된다. 최종 JSON은 스트리밍하지 않는다. */
+    onReasoning?: (fullReasoning: string, delta: string) => void;
+    /** fetch 취소용. abort 시 fetch가 중단되고 AbortError가 throw된다. */
+    signal?: AbortSignal;
+  },
 ): Promise<DSL> {
   const rawSummary = options?.pageSummary?.trim() || "";
   const safeSummary = rawSummary ? truncatePageSummary(rawSummary) : "";
@@ -356,7 +479,8 @@ export async function generateDSL(
 
   const provider = getLlmProvider();
   const providerConfig = LLM_PROVIDER_OPTIONS.find((o) => o.value === provider) ?? LLM_PROVIDER_OPTIONS[0];
-  const model = providerConfig.model;
+  // 로컬 LLM은 사용자가 설정한 모델 ID(gemma4:26b 등)를 쓴다. 나머지는 provider 기본 모델.
+  const model = provider === "local" ? getLocalModel() : providerConfig.model;
 
   let content: string;
 
@@ -387,6 +511,7 @@ export async function generateDSL(
         ],
         temperature: 0.2,
       }),
+      signal: options?.signal,
     });
 
     if (!response.ok) {
@@ -397,38 +522,74 @@ export async function generateDSL(
     const data = await response.json();
     content = data.content?.[0]?.text ?? "";
   } else {
-    const response = await fetch(OPENAI_API_URL, {
+    // openai와 local(OpenAI 호환)이 같은 chat completions 스펙을 공유한다.
+    const isLocal = provider === "local";
+    const url = isLocal ? buildLocalChatUrl() : OPENAI_API_URL;
+    const providerLabel = isLocal ? "Local LLM" : "OpenAI";
+
+    // 로컬 서버(Ollama·LM Studio 등)는 response_format: json_object 를 지원하지 않을 수 있어
+    // 400을 내뱉기 쉽다. 로컬은 이 옵션을 빼고, 대신 system 프롬프트로 JSON만 내도록 강제한다.
+    const systemPrompt = isLocal
+      ? `${SYSTEM_PROMPT}\n\n## 출력 형식 (엄수)\n마크다운 코드펜스나 설명 없이, 오직 유효한 JSON 객체 하나만 출력하라. 앞뒤에 어떤 텍스트도 붙이지 말 것.`
+      : SYSTEM_PROMPT;
+
+    // onReasoning이 있으면 SSE 스트리밍으로 받아 추론을 실시간 콜백한다. (local/openai 공통)
+    const onReasoning = options?.onReasoning;
+    const useStreaming = typeof onReasoning === "function";
+
+    const body: Record<string, unknown> = {
+      model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      temperature: 0.2,
+    };
+    if (!isLocal) {
+      body.response_format = { type: "json_object" };
+    }
+    if (useStreaming) {
+      body.stream = true;
+    }
+    // 주의: num_ctx는 표준 /v1/chat/completions 스펙에 없어, 엄격한 OpenAI 호환 서버는
+    // "num_ctx is not supported"로 400을 낸다. 컨텍스트 창은 서버 기동 시 고정값을 쓰므로
+    // 요청 body에 넣지 않는다.
+
+    // 로컬은 키 없이 열린 서버가 많다. 키가 있을 때만 Authorization을 붙인다.
+    const openAiHeaders: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) {
+      openAiHeaders["Authorization"] = `Bearer ${apiKey}`;
+    }
+
+    const response = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userContent },
-        ],
-        temperature: 0.2,
-        response_format: { type: "json_object" },
-      }),
+      headers: openAiHeaders,
+      body: JSON.stringify(body),
+      signal: options?.signal,
     });
 
     if (!response.ok) {
       const errorBody = await response.text();
-      throw new Error(`OpenAI API error (${response.status}): ${errorBody}`);
+      throw new Error(`${providerLabel} API error (${response.status}): ${errorBody}`);
     }
 
-    const data = await response.json();
-    content = data.choices?.[0]?.message?.content ?? "";
+    if (onReasoning && response.body) {
+      const streamed = await consumeOpenAiStream(response.body, onReasoning);
+      // 일부 로컬 추론 모델은 content를 비우고 reasoning에만 답(JSON)을 넣는다. 그 경우 reasoning으로 fallback.
+      content = streamed.content || streamed.reasoning;
+    } else {
+      const data = await response.json();
+      content = data.choices?.[0]?.message?.content ?? "";
+    }
   }
 
   if (!content) {
     throw new Error("LLM API returned empty content");
   }
 
-  const cleanedContent = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
-  const parsed: DSL = JSON.parse(cleanedContent);
+  const withoutThink = stripThinkBlocks(content);
+  const cleanedContent = withoutThink.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+  const parsed: DSL = parseDslJson(cleanedContent);
 
   if (!parsed.name || !Array.isArray(parsed.steps)) {
     throw new Error("Invalid DSL structure returned from LLM");

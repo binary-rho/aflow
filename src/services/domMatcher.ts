@@ -16,6 +16,8 @@ import {
   getApiKeyForProvider,
   getLlmMatcherEnabled,
   getAnthropicBaseUrl,
+  getLocalBaseUrl,
+  getLocalModel,
 } from "@/stores/settingsStore";
 import { textMatches, contextMatches } from "@/services/textMatch";
 import {
@@ -27,6 +29,7 @@ import {
 import { buildClientActiveScopeScript } from "@/services/scopeResolver";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_CHAT_PATH = "/v1/chat/completions";
 const ANTHROPIC_MESSAGES_PATH = "/v1/messages";
 const ANTHROPIC_API_VERSION = "2023-06-01";
 
@@ -34,6 +37,11 @@ const ANTHROPIC_API_VERSION = "2023-06-01";
 // (예: https://seulgivibe.lgudax.cool/anthropic) base URL을 넣어 우회한다.
 function buildAnthropicMessagesUrl(): string {
   return `${getAnthropicBaseUrl()}${ANTHROPIC_MESSAGES_PATH}`;
+}
+
+// 로컬 LLM 매처도 OpenAI 호환 /v1/chat/completions 를 쓰되 로컬 base URL로 나간다.
+function buildLocalChatUrl(): string {
+  return `${getLocalBaseUrl()}${OPENAI_CHAT_PATH}`;
 }
 
 // 매처는 라벨/요소 식별이라는 단순 분류 작업이라 gpt-4o-mini로도 정확도 충분하고,
@@ -389,14 +397,23 @@ async function callMatcherLLM(
     const data = await response.json();
     content = (data.content?.[0]?.text ?? "").trim();
   } else {
-    const response = await fetchLlmWithRetry(OPENAI_API_URL, {
+    // openai와 local(OpenAI 호환)이 같은 chat completions 스펙을 공유한다.
+    const isLocal = provider === "local";
+    const url = isLocal ? buildLocalChatUrl() : OPENAI_API_URL;
+    const matcherModel = isLocal ? getLocalModel() : OPENAI_MATCHER_MODEL;
+    const providerLabel = isLocal ? "Local LLM" : "OpenAI";
+    // 로컬은 키 없이 열린 서버가 많다. 키가 있을 때만 Authorization을 붙인다.
+    const openAiKey = isLocal ? apiKey || getApiKeyForProvider("local") || "" : apiKey;
+    const openAiHeaders: Record<string, string> = { "Content-Type": "application/json" };
+    if (openAiKey) {
+      openAiHeaders["Authorization"] = `Bearer ${openAiKey}`;
+    }
+    // num_ctx는 표준 chat completions 스펙에 없어 엄격한 서버는 400을 낸다. 넣지 않는다.
+    const response = await fetchLlmWithRetry(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
+      headers: openAiHeaders,
       body: JSON.stringify({
-        model: OPENAI_MATCHER_MODEL,
+        model: matcherModel,
         messages: [
           { role: "system", content: MATCHER_PROMPT },
           { role: "user", content: userMessage },
@@ -409,7 +426,7 @@ async function callMatcherLLM(
     if (!response.ok) {
       const bodyText = await response.text().catch(() => "");
       console.warn(
-        `[flux] OpenAI matcher API error: ${response.status} | body: ${bodyText.slice(0, 800)}`,
+        `[flux] ${providerLabel} matcher API error: ${response.status} | body: ${bodyText.slice(0, 800)}`,
       );
       return { kind: "not_found" };
     }
@@ -532,10 +549,12 @@ export async function resolveElement(
 
   const provider = llmProvider || getLlmProvider();
   const effectiveKey = apiKey || getApiKeyForProvider(provider as any) || "";
+  // 로컬 LLM은 키 없이 열린 서버가 많아 키 부재를 실행 차단 사유로 보지 않는다.
+  const requiresKey = provider !== "local";
   // 사내망 DLP가 매처 호출을 막아 매번 503으로 fallback될 때, 사용자가 명시적으로 끄면
   // 재시도 시간(스텝당 ~3초) 낭비 없이 곧장 후보 기반 fallback으로 처리한다.
   const matcherDisabled = !getLlmMatcherEnabled();
-  if (!effectiveKey || matcherDisabled) {
+  if ((requiresKey && !effectiveKey) || matcherDisabled) {
     if (matcherDisabled) {
       console.log("[flux] LLM matcher disabled — using code-based fallback only");
     }

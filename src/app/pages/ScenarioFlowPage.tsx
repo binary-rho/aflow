@@ -350,7 +350,7 @@ function FlowCanvasInner({
               className="w-full text-xs border border-[var(--flux-border)] rounded-lg px-2.5 py-2 outline-none focus:border-[var(--flux-primary)]"
             />
             <label className="text-[10px] font-bold text-[var(--flux-text-muted)]">
-              플로우 이름
+              조합시나리오 이름
             </label>
             <input
               type="text"

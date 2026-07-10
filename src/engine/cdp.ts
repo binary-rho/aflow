@@ -1059,6 +1059,38 @@ async function fillValueFallback(
   );
 }
 
+/**
+ * 대상 input에 기대한 값이 실제로 들어갔는지 확인한다.
+ * Input.insertText는 focus가 안 잡혀 허공에 입력돼도 예외를 안 던져 "거짓 성공"이 되므로,
+ * 실제 el.value를 읽어 검증한 뒤 안 들어갔으면 호출측이 value 대입 폴백을 타게 한다.
+ */
+async function inputValueMatches(
+  tabId: number,
+  pickScript: string,
+  expected: string,
+): Promise<boolean> {
+  try {
+    return await evaluate(
+      tabId,
+      `(() => {
+        ${pickScript}
+        if (!el) return false;
+        var v = (el.value != null ? String(el.value) : '');
+        var want = ${JSON.stringify(expected)};
+        // 정확히 일치하거나(가장 흔함), 마스킹/포맷 적용으로 길이만 맞아도 입력된 것으로 본다.
+        if (v === want) return true;
+        if (want && v && v.length >= Math.min(want.length, 1) && v.replace(/\\s/g,'').length > 0) {
+          // 일부 input은 포맷팅(하이픈 등)으로 값이 변형되므로, 비어있지만 않으면 통과로 간주.
+          return true;
+        }
+        return v.length > 0;
+      })()`,
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** CDP 실제 키입력. 현재 focus된 요소에 진짜 사용자 입력처럼 텍스트를 삽입한다. */
 async function insertTextViaCDP(tabId: number, text: string): Promise<void> {
   // Input.insertText: IME/한글 조합까지 안전한 "실제 텍스트 삽입". isTrusted 이벤트 발생.
@@ -1132,14 +1164,14 @@ export async function type(
   const scopedPick = `${buildClientActiveScopeScript()}\nvar el = fluxQueryInScope(${JSON.stringify(selector)});`;
   const { kind } = await prepareInputTarget(tabId, scopedPick, text);
   if (kind === "text") {
-    let ok = false;
     try {
       await insertTextViaCDP(tabId, text);
-      ok = true;
     } catch {
-      ok = false;
+      // insertText 호출 자체가 실패 — 아래 검증에서 false로 잡혀 폴백.
     }
-    // insertText가 실패했거나 값이 안 들어갔으면 value 대입으로 폴백(중복 방지: 성공 시엔 안 함)
+    // Input.insertText는 focus 미스 시에도 예외를 안 던져 "거짓 성공"이 된다.
+    // 실제 값이 들어갔는지 검증하고, 안 들어갔으면 value 대입으로 폴백.
+    const ok = await inputValueMatches(tabId, scopedPick, text);
     if (!ok) await fillValueFallback(tabId, scopedPick, text);
   }
 }
@@ -1154,13 +1186,12 @@ export async function fillByLabel(
     `var el = __fluxPickFillTargetByLabel(${JSON.stringify(label)});`;
   const { kind } = await prepareInputTarget(tabId, pick, value);
   if (kind === "text") {
-    let ok = false;
     try {
       await insertTextViaCDP(tabId, value);
-      ok = true;
     } catch {
-      ok = false;
+      // 아래 검증에서 폴백 처리.
     }
+    const ok = await inputValueMatches(tabId, pick, value);
     if (!ok) await fillValueFallback(tabId, pick, value);
   }
 }

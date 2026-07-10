@@ -297,7 +297,7 @@ function FlowDetailInner({
             onKeyDown={(e) => {
               if (e.key === "Enter") (e.target as HTMLInputElement).blur();
             }}
-            title="플로우 이름 (저장: 포커스 해제 또는 Enter)"
+            title="조합시나리오 이름 (저장: 포커스 해제 또는 Enter)"
             className="font-bold text-sm text-[var(--flux-text-default)] flex-1 min-w-0 bg-transparent border border-transparent rounded px-1 -mx-0.5 hover:border-[var(--flux-border-light)] focus:border-violet-400 focus:outline-none"
           />
         </div>

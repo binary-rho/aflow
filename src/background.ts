@@ -17,6 +17,7 @@ type MessageType =
   | { type: "PING" }
   | { type: "GET_INSPECTED_TAB_URL"; tabId: number }
   | { type: "GET_ACTIVE_TAB_URL" }
+  | { type: "NAVIGATE_ACTIVE_TAB"; url: string }
   | { type: "EVAL_DOM_SCRIPT"; tabId: number; script: string }
   | {
       type: "RUN_SCENARIO";
@@ -323,6 +324,21 @@ chrome.runtime.onMessage.addListener(
         chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
           const tab = tabs?.find((t) => t.url && !t.url.startsWith("chrome"));
           sendResponse({ url: tab?.url ?? "", tabId: tab?.id ?? null });
+        });
+        return true;
+      }
+
+      case "NAVIGATE_ACTIVE_TAB": {
+        const targetUrl = message.url;
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+          const tab = tabs?.find((t) => t.url && !t.url.startsWith("chrome"));
+          if (tab?.id == null) {
+            sendResponse({ ok: false, error: "활성 탭을 찾을 수 없습니다." });
+            return;
+          }
+          chrome.tabs.update(tab.id, { url: targetUrl }, () => {
+            sendResponse({ ok: true });
+          });
         });
         return true;
       }

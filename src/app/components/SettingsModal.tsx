@@ -10,6 +10,11 @@ import {
   getAnthropicBaseUrl,
   setAnthropicBaseUrl,
   DEFAULT_ANTHROPIC_BASE_URL,
+  getLocalBaseUrl,
+  setLocalBaseUrl,
+  normalizeLocalBaseUrl,
+  getLocalModel,
+  setLocalModel,
   getLlmMatcherEnabled,
   setLlmMatcherEnabled,
   type LlmProvider,
@@ -36,6 +41,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [provider, setProvider] = useState<LlmProvider>("openai");
   const [testResult, setTestResult] = useState<TestResult>({ kind: "idle" });
   const [anthropicBaseUrl, setAnthropicBaseUrlInput] = useState("");
+  const [localBaseUrl, setLocalBaseUrlInput] = useState("");
+  const [localModel, setLocalModelInput] = useState("");
   const [matcherEnabled, setMatcherEnabledState] = useState(true);
 
   useEffect(() => {
@@ -47,6 +54,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       setAnthropicBaseUrlInput(
         storedBaseUrl === DEFAULT_ANTHROPIC_BASE_URL ? "" : storedBaseUrl,
       );
+      setLocalBaseUrlInput(getLocalBaseUrl());
+      setLocalModelInput(getLocalModel());
       setMatcherEnabledState(getLlmMatcherEnabled());
       setSaved(false);
       setTestResult({ kind: "idle" });
@@ -64,6 +73,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     }
     setLlmProvider(provider);
     setAnthropicBaseUrl(anthropicBaseUrl);
+    setLocalBaseUrl(localBaseUrl);
+    setLocalModel(localModel);
     setLlmMatcherEnabled(matcherEnabled);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
@@ -73,7 +84,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   // OpenAI는 무료 GET /v1/models, Anthropic은 max_tokens=1 짧은 POST(미세 과금).
   const handleTest = async () => {
     const trimmed = key.trim();
-    if (!trimmed) {
+    // 로컬 LLM은 키 없이 열려 있는 서버가 많아 키를 필수로 요구하지 않는다.
+    if (!trimmed && provider !== "local") {
       setTestResult({ kind: "fail", message: "키를 먼저 입력하세요." });
       return;
     }
@@ -83,6 +95,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       // 테스트만 api.anthropic.com으로 가면 회사 방화벽에 막혀 결과가 무의미해진다.
       const result = await testApiKey(provider, trimmed, {
         anthropicBaseUrl: normalizeBaseUrl(anthropicBaseUrl) || DEFAULT_ANTHROPIC_BASE_URL,
+        localBaseUrl: normalizeLocalBaseUrl(localBaseUrl),
+        localModel: localModel.trim(),
       });
       setTestResult(result);
     } catch (err) {
@@ -162,7 +176,11 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
 
           <div>
             <label className="block text-xs font-bold text-[var(--flux-text-muted)] mb-1.5">
-              {provider === "anthropic" ? "Anthropic API Key" : "OpenAI API Key"}
+              {provider === "anthropic"
+                ? "Anthropic API Key"
+                : provider === "local"
+                  ? "로컬 LLM API Key (선택)"
+                  : "OpenAI API Key"}
             </label>
             <div className="relative">
               <input
@@ -173,7 +191,13 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   setSaved(false);
                 }}
                 onFocus={() => setShowKey(true)}
-                placeholder={provider === "anthropic" ? "sk-ant-..." : "sk-..."}
+                placeholder={
+                  provider === "anthropic"
+                    ? "sk-ant-..."
+                    : provider === "local"
+                      ? "키가 없으면 비워두세요"
+                      : "sk-..."
+                }
                 className="w-full px-3 py-2.5 pr-10 text-xs font-mono bg-[var(--flux-bg-subtle)] border border-[var(--flux-border)] rounded-lg outline-none focus:border-[var(--flux-primary)] focus:ring-2 focus:ring-[var(--flux-ring)] transition-all"
               />
               <button
@@ -215,6 +239,49 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     https://seulgivibe.lgudax.cool/anthropic
                   </code>
                 </p>
+              </div>
+            )}
+
+            {provider === "local" && (
+              <div className="mt-3 space-y-3">
+                <div>
+                  <label className="block text-xs font-bold text-[var(--flux-text-muted)] mb-1.5">
+                    Base URL
+                  </label>
+                  <input
+                    type="text"
+                    value={localBaseUrl}
+                    onChange={(e) => {
+                      setLocalBaseUrlInput(e.target.value);
+                      setSaved(false);
+                    }}
+                    placeholder="http://172.24.63.178:180"
+                    className="w-full px-3 py-2.5 text-xs font-mono bg-[var(--flux-bg-subtle)] border border-[var(--flux-border)] rounded-lg outline-none focus:border-[var(--flux-primary)] focus:ring-2 focus:ring-[var(--flux-ring)] transition-all"
+                  />
+                  <p className="text-[10px] text-[var(--flux-text-muted)] mt-1.5 leading-relaxed">
+                    OpenAI 호환 로컬/사내 LLM 주소. Cline의 Base URL과 같은 값을
+                    넣으세요. <code className="text-[10px]">/v1/chat/completions</code>{" "}
+                    는 자동으로 붙습니다.
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-[var(--flux-text-muted)] mb-1.5">
+                    Model ID
+                  </label>
+                  <input
+                    type="text"
+                    value={localModel}
+                    onChange={(e) => {
+                      setLocalModelInput(e.target.value);
+                      setSaved(false);
+                    }}
+                    placeholder="gemma4:26b"
+                    className="w-full px-3 py-2.5 text-xs font-mono bg-[var(--flux-bg-subtle)] border border-[var(--flux-border)] rounded-lg outline-none focus:border-[var(--flux-primary)] focus:ring-2 focus:ring-[var(--flux-ring)] transition-all"
+                  />
+                  <p className="text-[10px] text-[var(--flux-text-muted)] mt-1.5 leading-relaxed">
+                    Cline의 Model ID와 같은 값을 넣으세요.
+                  </p>
+                </div>
               </div>
             )}
 
@@ -315,8 +382,9 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   );
 }
 
-const OPENAI_MODELS_URL = "https://api.openai.com/v1/models";
-const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_BASE_URL = "https://api.openai.com";
+const OPENAI_MODELS_PATH = "/v1/models";
+const OPENAI_CHAT_PATH = "/v1/chat/completions";
 const ANTHROPIC_MESSAGES_PATH = "/v1/messages";
 const ANTHROPIC_API_VERSION = "2023-06-01";
 // 매처와 동일한 모델로 ping해야 endpoint 단위 장애·권한 문제를 정확히 진단할 수 있다.
@@ -329,39 +397,69 @@ function normalizeBaseUrl(url: string): string {
 async function testApiKey(
   provider: LlmProvider,
   apiKey: string,
-  options: { anthropicBaseUrl: string },
+  options: { anthropicBaseUrl: string; localBaseUrl: string; localModel: string },
 ): Promise<TestResult> {
   if (provider === "openai") {
-    return testOpenAIKey(apiKey);
+    return testOpenAICompatible("OpenAI", OPENAI_BASE_URL, apiKey, OPENAI_MATCHER_MODEL);
+  }
+  if (provider === "local") {
+    if (!options.localBaseUrl) {
+      return { kind: "fail", message: "Base URL을 먼저 입력하세요." };
+    }
+    if (!options.localModel) {
+      return { kind: "fail", message: "Model ID를 먼저 입력하세요." };
+    }
+    return testOpenAICompatible(
+      "Local LLM",
+      options.localBaseUrl,
+      apiKey,
+      options.localModel,
+      { skipModelsCheck: true },
+    );
   }
   return testAnthropicKey(apiKey, options.anthropicBaseUrl);
 }
 
-// 두 단계 진단:
-//   1) GET /v1/models  — 키 자체와 기본 인증/네트워크 확인 (무료)
-//   2) POST /v1/chat/completions (max_tokens=1) — 매처가 실제 쓰는 endpoint·모델 권한 확인 (≈$0.0001)
-// 둘로 나누면 "키는 멀쩡한데 chat completions만 503" 같은 구분이 가능해진다.
-async function testOpenAIKey(apiKey: string): Promise<TestResult> {
-  const modelsRes = await fetch(OPENAI_MODELS_URL, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
-  if (!modelsRes.ok) {
-    const reason = extractErrorReason(await modelsRes.text().catch(() => ""));
-    return {
-      kind: "fail",
-      message: `[GET /v1/models] ${classifyHttpFailure("OpenAI", modelsRes.status, reason)}`,
-    };
+// OpenAI 호환 endpoint(공식 OpenAI + 로컬/사내 LLM 공용) 진단.
+// OpenAI 공식은 두 단계로 나눠 "키는 멀쩡한데 chat completions만 503" 구분이 가능하다:
+//   1) GET /v1/models  — 키·기본 인증/네트워크 확인 (무료)
+//   2) POST /v1/chat/completions (max_tokens=1) — 실제 매처 endpoint·모델 권한 확인
+// 로컬 서버는 /v1/models 를 지원하지 않을 수 있어(skipModelsCheck) chat completions만 친다.
+async function testOpenAICompatible(
+  label: string,
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  options?: { skipModelsCheck?: boolean },
+): Promise<TestResult> {
+  const base = normalizeBaseUrl(baseUrl);
+  // 로컬은 키가 없을 수 있다. 있을 때만 Authorization 헤더를 붙인다.
+  const authHeaders: Record<string, string> = apiKey
+    ? { Authorization: `Bearer ${apiKey}` }
+    : {};
+
+  if (!options?.skipModelsCheck) {
+    const modelsRes = await fetch(`${base}${OPENAI_MODELS_PATH}`, {
+      method: "GET",
+      headers: authHeaders,
+    });
+    if (!modelsRes.ok) {
+      const reason = extractErrorReason(await modelsRes.text().catch(() => ""));
+      return {
+        kind: "fail",
+        message: `[GET /v1/models] ${classifyHttpFailure(label, modelsRes.status, reason)}`,
+      };
+    }
   }
 
-  const chatRes = await fetch(OPENAI_CHAT_URL, {
+  const chatRes = await fetch(`${base}${OPENAI_CHAT_PATH}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
+      ...authHeaders,
     },
     body: JSON.stringify({
-      model: OPENAI_MATCHER_MODEL,
+      model,
       messages: [{ role: "user", content: "ping" }],
       max_tokens: 1,
       temperature: 0,
@@ -370,13 +468,13 @@ async function testOpenAIKey(apiKey: string): Promise<TestResult> {
   if (chatRes.ok) {
     return {
       kind: "ok",
-      message: `OpenAI 키 + ${OPENAI_MATCHER_MODEL} 호출 정상 ✓`,
+      message: `${label} + ${model} 호출 정상 ✓`,
     };
   }
   const reason = extractErrorReason(await chatRes.text().catch(() => ""));
   return {
     kind: "fail",
-    message: `[POST /v1/chat/completions] ${classifyHttpFailure("OpenAI", chatRes.status, reason)}`,
+    message: `[POST /v1/chat/completions] ${classifyHttpFailure(label, chatRes.status, reason)}`,
   };
 }
 

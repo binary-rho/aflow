@@ -7,7 +7,9 @@
   "host_permissions": [
     "https://api.openai.com/*",
     "https://api.anthropic.com/*",
-    "https://*.lgudax.cool/*"
+    "https://*.lgudax.cool/*",
+    "http://digitalplatform-iop.cloud/*",
+    "https://digitalplatform-iop.cloud/*"
   ],
   "action": {
     "default_title": "flux"
