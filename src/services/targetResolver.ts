@@ -134,8 +134,12 @@ async function selectorMatchesText(
       var expectedText = ${JSON.stringify(text)};
       var el = fluxQueryInScope(selector);
       if (!el) return false;
+      if (!expectedText) return true;
       var elText = (el.innerText || el.textContent || "").trim();
-      return !expectedText || fluxTextMatches(elText, expectedText);
+      // 저장된 selector가 여전히 "그 요소"인지 정확 일치로 검증한다.
+      // 부분 포함을 허용하면 "S26"이 "S26+"(다른 상품)를 통과시키므로 exact만 쓴다.
+      // 녹화 때 저장한 text도 동일 방식으로 뽑히므로 정상 케이스는 exact로 맞는다.
+      return fluxTextMatchesExact(elText, expectedText);
     })()`,
   );
 }

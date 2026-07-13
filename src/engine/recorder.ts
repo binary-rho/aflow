@@ -1,10 +1,15 @@
 import * as cdp from "./cdp";
+import { buildContextExtractorScript } from "@/services/contextExtractor";
 
 export interface RecordedClickEvent {
   type: "click";
   text: string;
   selector?: string | null;
   context?: string | null;
+  /** 가장 가까운 의미 영역(dialog/form/nav/...). 실행 매칭기와 대칭 저장. */
+  nearestLandmark?: string | null;
+  /** aria-label 등 접근성 이름. 실행 매칭기와 대칭 저장. */
+  accessibleName?: string | null;
   inHeader?: boolean;
   href?: string | null;
   ts: number;
@@ -93,6 +98,7 @@ const INJECT_SCRIPT = `
   if (window.__fluxRecorderActive) return;
   window.__fluxRecorderActive = true;
 
+  ${buildContextExtractorScript()}
   var norm = function(s) { return (s || '').trim().replace(/\\s+/g, ' '); };
   var CLICKABLE = 'button, a, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="option"], summary, details';
   var CHECKABLE = 'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]';
@@ -249,16 +255,9 @@ const INJECT_SCRIPT = `
     return parts.join(' > ');
   }
 
-  function getContext(el) {
-    var gtmContainer = el.closest('[data-gtm-event-label]');
-    if (gtmContainer) {
-      var gtmLabel = gtmContainer.getAttribute('data-gtm-event-label');
-      if (gtmLabel) return gtmLabel.trim().slice(0, 100);
-    }
-    var parent = el.closest('li, article, section, dl, .card, [class*="card"], [class*="product"], [class*="priceplan"], [role="dialog"], .modal, [class*="modal"], nav, header') || el.parentElement;
-    if (!parent) return null;
-    return norm(parent.textContent || '').slice(0, 80) || null;
-  }
+  // context/landmark/accessibleName은 contextExtractor.ts 단일 소스를 사용해
+  // 실행(domSnapshot)과 동일한 형식으로 저장한다. (예전엔 조상 텍스트 덩어리라 매칭이 안 맞았음)
+  var getContext = __fluxGetContext;
 
   function getFieldLabel(el) {
     var id = (el.id || '').trim();
@@ -441,9 +440,11 @@ const INJECT_SCRIPT = `
     var selector = text ? getSelector(target) : getSelector(target, { allowBrittle: true });
     if (!text && !selector) return;
     var context = getContext(target);
+    var nearestLandmark = __fluxGetNearestLandmark(target);
+    var accessibleName = __fluxGetAccessibleName(target, text);
     var href = target.getAttribute('href');
     var inHeader = !!target.closest('header, nav, [role="navigation"], [class*="gnb"], [class*="menu"]');
-    send({ type: 'click', text: text, selector: selector, context: context, href: href || null, inHeader: inHeader, ts: Date.now() });
+    send({ type: 'click', text: text, selector: selector, context: context, nearestLandmark: nearestLandmark, accessibleName: accessibleName, href: href || null, inHeader: inHeader, ts: Date.now() });
   }, true);
 
   /**

@@ -19,7 +19,7 @@ import {
   getLocalBaseUrl,
   getLocalModel,
 } from "@/stores/settingsStore";
-import { textMatches, contextMatches } from "@/services/textMatch";
+import { textMatches, textMatchesExact, contextMatches } from "@/services/textMatch";
 import {
   buildSelectorCacheKey,
   getCachedSelector,
@@ -214,23 +214,19 @@ function tryCtaStrategies(
 ): FastPathResult {
   const target = intent.text!;
 
-  // 1. testId 매칭 — 가장 강한 신호
-  const byTestId = ctas.filter(
-    (c) => c.testId && textMatches(c.testId, target),
-  );
-  if (byTestId.length === 1) {
-    return { kind: "resolved", selector: byTestId[0].selector!, via: "unique-text" };
-  }
-
-  // 2. accessibleName 정확 매치
+  // 1. accessibleName 정확 매치
   const byAccName = ctas.filter((c) => textMatches(c.accessibleName, target));
   if (byAccName.length === 1) {
     return { kind: "resolved", selector: byAccName[0].selector!, via: "unique-text" };
   }
 
-  // 3. text 매칭
-  const byText = ctas.filter((c) => textMatches(c.text, target));
-  console.log(`[flux] tryFastPath: ${byText.length} text matches for "${target}"`);
+  // 3. text 매칭 — 정확 일치 우선, 없을 때만 부분 포함으로 폴백.
+  //    "갤럭시S26"으로 "갤럭시S26+"가 잡히던 문제를 막는다(부분 포함은 접미/접두 충돌).
+  const byTextExact = ctas.filter((c) => textMatchesExact(c.text, target));
+  const byText = byTextExact.length > 0 ? byTextExact : ctas.filter((c) => textMatches(c.text, target));
+  console.log(
+    `[flux] tryFastPath: ${byText.length} text matches for "${target}" (${byTextExact.length > 0 ? "exact" : "partial"})`,
+  );
   if (byText.length === 1) return { kind: "resolved", selector: byText[0].selector!, via: "unique-text" };
   if (byText.length === 0) return { kind: "none" };
 
@@ -268,21 +264,21 @@ function tryFormFieldStrategies(
 ): FastPathResult {
   const target = intent.label!;
 
-  // 1. testId
-  const byTestId = fields.filter((f) => f.testId && textMatches(f.testId, target));
-  if (byTestId.length === 1) return { kind: "resolved", selector: byTestId[0].selector!, via: "unique-text" };
-
-  // 2. ariaLabel
+  // 1. ariaLabel
   const byAria = fields.filter((f) => textMatches(f.ariaLabel, target));
   if (byAria.length === 1) return { kind: "resolved", selector: byAria[0].selector!, via: "unique-text" };
 
-  // 3. label/placeholder/name
-  const byLabel = fields.filter(
-    (f) =>
-      textMatches(f.label, target) ||
-      textMatches(f.placeholder, target) ||
-      textMatches(f.name, target),
-  );
+  // 3. label/placeholder/name — 정확 일치 우선, 없을 때만 부분 포함 폴백.
+  const labelExact = (f: (typeof fields)[number]) =>
+    textMatchesExact(f.label, target) ||
+    textMatchesExact(f.placeholder, target) ||
+    textMatchesExact(f.name, target);
+  const labelPartial = (f: (typeof fields)[number]) =>
+    textMatches(f.label, target) ||
+    textMatches(f.placeholder, target) ||
+    textMatches(f.name, target);
+  const byLabelExact = fields.filter(labelExact);
+  const byLabel = byLabelExact.length > 0 ? byLabelExact : fields.filter(labelPartial);
   if (byLabel.length === 1) return { kind: "resolved", selector: byLabel[0].selector!, via: "unique-text" };
   if (byLabel.length === 0) return { kind: "none" };
 

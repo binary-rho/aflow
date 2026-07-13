@@ -38,6 +38,22 @@ export function normalizeContextForMatch(s: string | null | undefined): string {
 
 const MIN_PARTIAL_MATCH_LENGTH = 3;
 
+/**
+ * 정규화 후 완전 일치만 허용. 부분 포함은 보지 않는다.
+ * "갤럭시S26"으로 "갤럭시S26+"가 잘못 잡히는(부분 포함) 문제를 막기 위해,
+ * 리스트/후보를 좁힐 때 이 함수를 우선 시도하고 textMatches(부분)는 폴백으로 쓴다.
+ */
+export function textMatchesExact(
+  itemText: string | null | undefined,
+  searchText: string | null | undefined,
+): boolean {
+  if (!itemText || !searchText) return false;
+  const a = normalizeForMatch(itemText);
+  const b = normalizeForMatch(searchText);
+  if (!a || !b) return false;
+  return a === b;
+}
+
 /** 양방향 포함 매칭 (a가 b를 포함하거나 b가 a를 포함). 짧은 문자열은 동일 매치만 허용. */
 export function textMatches(
   itemText: string | null | undefined,
@@ -95,6 +111,12 @@ export function buildClientNormalizerScript(): string {
       var shorter = a.length <= b.length ? a : b;
       if (shorter.length < ${MIN_PARTIAL_MATCH_LENGTH}) return false;
       return a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
+    };
+    var fluxTextMatchesExact = function(itemText, searchText) {
+      if (!itemText || !searchText) return false;
+      var a = fluxNormalize(itemText);
+      var b = fluxNormalize(searchText);
+      return !!a && !!b && a === b;
     };
   `;
 }

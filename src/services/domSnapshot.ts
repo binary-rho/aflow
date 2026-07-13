@@ -1,4 +1,5 @@
 import { buildClientActiveScopeScript } from "@/services/scopeResolver";
+import { buildContextExtractorScript } from "@/services/contextExtractor";
 
 /** LLM/토큰 누수 방지: 텍스트에서 개인정보·토큰 패턴을 마스킹합니다. (페이지 요약용) */
 function maskPII(text: string): string {
@@ -36,7 +37,6 @@ export function formatPageSummaryForLLM(summary: PageSummaryPayload): string {
       if (c.accessibleName && c.accessibleName !== c.text) {
         parts.push("name \"" + maskPII(c.accessibleName) + "\"");
       }
-      if (c.testId) parts.push("testId \"" + c.testId + "\"");
       if (c.nearestLandmark) parts.push("@" + c.nearestLandmark);
       if (c.context) parts.push("in " + c.context);
       if (c.gtm?.clickText) parts.push("gtm-text \"" + c.gtm.clickText + "\"");
@@ -56,7 +56,6 @@ export function formatPageSummaryForLLM(summary: PageSummaryPayload): string {
       if (f.ariaLabel && f.ariaLabel !== label) {
         parts.push("aria \"" + maskPII(f.ariaLabel) + "\"");
       }
-      if (f.testId) parts.push("testId \"" + f.testId + "\"");
       if (f.nearestLandmark) parts.push("@" + f.nearestLandmark);
       if (f.options?.length) parts.push("options: " + f.options.map((o) => `"${o}"`).join(", "));
       if (f.context) parts.push("in " + f.context);
@@ -66,7 +65,6 @@ export function formatPageSummaryForLLM(summary: PageSummaryPayload): string {
   }
   if (summary.navItems?.length) lines.push(`nav: ${summary.navItems.map((n) => maskPII(n)).join(" | ")}`);
   if (summary.modalPhrases?.length) lines.push(`modals/toast: ${summary.modalPhrases.map((m) => maskPII(m)).join(" | ")}`);
-  if (summary.testIds?.length) lines.push(`data-testid: ${summary.testIds.join(", ")}`);
   return lines.filter(Boolean).join("\n");
 }
 
@@ -102,8 +100,6 @@ export interface CtaSummary {
   gtm?: GtmAttributes;
   /** aria-label 또는 정제된 표시 텍스트 (요소 식별의 1순위) */
   accessibleName?: string | null;
-  /** data-testid / data-test-id (있으면 식별 우선순위 1순위) */
-  testId?: string | null;
   /** 가장 가까운 의미 영역 */
   nearestLandmark?: NearestLandmark;
 }
@@ -117,7 +113,6 @@ export interface FormFieldSummary {
   inputType: string | null;
   options?: string[];
   ariaLabel?: string | null;
-  testId?: string | null;
   nearestLandmark?: NearestLandmark;
 }
 
@@ -137,7 +132,6 @@ export interface PageSummaryPayload {
   formFields: FormFieldSummary[];
   navItems: string[];
   modalPhrases: string[];
-  testIds: string[];
 }
 
 /**
@@ -149,6 +143,7 @@ export interface PageSummaryPayload {
 export const DOM_PAGE_SUMMARY_SCRIPT = `
 (function() {
   ${buildClientActiveScopeScript()}
+  ${buildContextExtractorScript()}
   function mask(s) {
     if (!s || typeof s !== 'string') return s;
     return s
@@ -177,68 +172,9 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
     if (/[-_](active|hover|focus|show|hide|open|close|visible|hidden|selected|disabled|current)$/i.test(c)) return false;
     return true;
   }
-  function getContext(el) {
-    var cur = el.parentElement;
-    var d = 0;
-    var innerCtx = null;
-    var containerType = null;
-    var headings = [];
-    while (cur && d < 10 && cur !== document.body) {
-      d++;
-      var tag = cur.tagName.toLowerCase();
-      var role = (cur.getAttribute('role') || '').trim();
-      var cls = (typeof cur.className === 'string') ? cur.className.trim() : '';
-      var isSemantic = 'section article nav header footer main aside form dialog'.split(' ').indexOf(tag) >= 0;
-      var isRole = 'region navigation banner contentinfo main dialog form search'.split(' ').indexOf(role) >= 0;
-      var ctxClass = cls ? (cls.split(/\\s+/).filter(function(c) {
-        return /(card|item|product|banner|slide|menu|tab|modal|panel|group|login|signup|search|filter|content|area|popup|popover|bottomsheet|bottom-sheet|tooltip|toast|snackbar|drawer|overlay|layer)/i.test(c);
-      })[0] || null) : null;
-      if (!containerType) {
-        if (tag === 'dialog' || role === 'dialog' || role === 'alertdialog') containerType = 'dialog';
-        else if (/(bottom[-_]?sheet|bottomsheet)/i.test(cls)) containerType = 'bottomsheet';
-        else if (role === 'tooltip') containerType = 'tooltip';
-        else if (/(popup|popover)/i.test(cls) || cur.hasAttribute('popover')) containerType = 'popup';
-        else if (cur.getAttribute('aria-modal') === 'true' || /\bmodal\b/i.test(cls)) containerType = 'modal';
-        else if (/(toast|snackbar)/i.test(cls) || role === 'status') containerType = 'toast';
-      }
-      var hEl = cur.querySelector('h1, h2, h3, h4, h5, h6, [role="heading"]');
-      var ht = hEl ? mask((hEl.innerText || '').trim().replace(/\\s+/g, ' ')).slice(0, 60) : null;
-      if (!ht) {
-        for (var ci = 0; ci < Math.min(cur.children.length, 5); ci++) {
-          var ch = cur.children[ci];
-          if (!ch || !ch.tagName) continue;
-          var chtag = ch.tagName.toLowerCase();
-          if (chtag === 'section' || chtag === 'ul' || chtag === 'ol' || chtag === 'table' || chtag === 'form') continue;
-          if (ch.querySelector && ch.querySelector('section, article, ul, ol, table')) continue;
-          var chtx = mask((ch.innerText || '').trim().replace(/\\s+/g, ' ')).slice(0, 60);
-          if (chtx && chtx.length >= 2 && chtx.length <= 60) { ht = chtx; break; }
-        }
-      }
-      var al = (cur.getAttribute('aria-label') || '').trim().slice(0, 60) || null;
-      if (ht && headings.indexOf(ht) < 0) headings.push(ht);
-      if ((isSemantic || isRole || ctxClass) && !innerCtx) {
-        var name = ctxClass || (role && role !== tag ? role : tag);
-        var desc = ht || al;
-        innerCtx = desc ? name + '("' + desc + '")' : name;
-      }
-      cur = cur.parentElement;
-    }
-    if (containerType && innerCtx && innerCtx.indexOf(containerType) < 0) {
-      innerCtx = containerType + ' > ' + innerCtx;
-    } else if (containerType && !innerCtx) {
-      innerCtx = containerType;
-    }
-    var outerHeading = headings.length > 1 ? headings[headings.length - 1] : null;
-    if (innerCtx) {
-      if (outerHeading && innerCtx.indexOf(outerHeading) < 0) {
-        return innerCtx + ' in heading("' + outerHeading + '")';
-      }
-      return innerCtx;
-    }
-    if (outerHeading) return 'heading("' + outerHeading + '")';
-    if (headings.length > 0) return 'heading("' + headings[0] + '")';
-    return null;
-  }
+  // context/landmark/accessibleName 추출은 contextExtractor.ts의 단일 소스를 사용한다.
+  // (buildContextExtractorScript로 __fluxGetContext/__fluxGetNearestLandmark/__fluxGetAccessibleName 주입됨)
+  var getContext = __fluxGetContext;
   function buildSelector(el) {
     var id = (el.id || '').trim();
     if (id && /^[a-zA-Z][\\w-]*$/.test(id)) {
@@ -374,7 +310,7 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
         }
       }
     }
-    if (!root) return JSON.stringify({ path: '', title: null, h1: null, headings: [], viewport: null, ctas: [], formFields: [], navItems: [], modalPhrases: [], testIds: [], modalActive: false, modalTitle: null });
+    if (!root) return JSON.stringify({ path: '', title: null, h1: null, headings: [], viewport: null, ctas: [], formFields: [], navItems: [], modalPhrases: [], modalActive: false, modalTitle: null });
     var path = (location.pathname || '/').trim();
     var hostName = (location.host || '').trim() || null;
     var title = (document.title || '').trim() ? mask(document.title).slice(0, 150) : null;
@@ -391,49 +327,15 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
     });
     var h1 = root.querySelector('h1');
     var firstH1 = h1 ? text(h1) : null;
-    function getNearestLandmark(el) {
-      var cur = el.parentElement;
-      var hops = 0;
-      while (cur && hops < 12 && cur !== document.body) {
-        hops++;
-        var tag = cur.tagName.toLowerCase();
-        var role = (cur.getAttribute('role') || '').trim().toLowerCase();
-        if (tag === 'dialog' || role === 'dialog' || role === 'alertdialog') return 'dialog';
-        if (tag === 'form' || role === 'form') return 'form';
-        if (tag === 'header' || role === 'banner') return 'header';
-        if (tag === 'nav' || role === 'navigation') return 'nav';
-        if (tag === 'footer' || role === 'contentinfo') return 'footer';
-        if (tag === 'main' || role === 'main') return 'main';
-        if (tag === 'section' || role === 'region') return 'section';
-        cur = cur.parentElement;
-      }
-      return null;
-    }
-    function getTestId(el) {
-      return (el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-cy') || el.getAttribute('data-e2e') || '').trim() || null;
-    }
-    function getAccessibleName(el, fallbackText) {
-      var aria = (el.getAttribute('aria-label') || '').trim();
-      if (aria) return aria;
-      var labelledBy = (el.getAttribute('aria-labelledby') || '').trim();
-      if (labelledBy) {
-        var parts = labelledBy.split(/\\s+/).map(function(id) {
-          var ref = document.getElementById(id);
-          return ref ? (ref.textContent || '').trim() : '';
-        }).filter(Boolean);
-        if (parts.length) return parts.join(' ').slice(0, 120);
-      }
-      var title = (el.getAttribute('title') || '').trim();
-      if (title) return title;
-      return fallbackText || null;
-    }
+    // landmark/accessibleName은 contextExtractor.ts 단일 소스를 사용(녹화와 동일).
+    var getNearestLandmark = __fluxGetNearestLandmark;
+    var getAccessibleName = __fluxGetAccessibleName;
     /**
      * 잘리더라도 중요한 게 남게 — 식별 단서가 강한 element를 앞으로 정렬한다.
      * 안정 우선순위 정렬(같은 가중치면 원래 DOM 순서 유지).
      */
     function ctaWeight(c) {
       var w = 0;
-      if (c.testId) w += 3;
       if (c.gtm) w += 2;
       if (c.nearestLandmark === 'dialog') w += 3;
       else if (c.nearestLandmark === 'form') w += 2;
@@ -443,7 +345,6 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
     }
     function fieldWeight(f) {
       var w = 0;
-      if (f.testId) w += 3;
       if (f.nearestLandmark === 'dialog') w += 3;
       else if (f.nearestLandmark === 'form') w += 2;
       else if (f.nearestLandmark === 'main') w += 1;
@@ -482,7 +383,6 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
         gtmText: gtmObj ? gtmObj.clickText : null,
         gtm: gtmObj,
         accessibleName: getAccessibleName(el, t),
-        testId: getTestId(el),
         nearestLandmark: getNearestLandmark(el)
       });
     });
@@ -517,7 +417,6 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
         inputType: inputType,
         options: options,
         ariaLabel: ariaLabel,
-        testId: getTestId(el),
         nearestLandmark: getNearestLandmark(el)
       });
     });
@@ -576,7 +475,6 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
         inputType: 'custom-select',
         options: options,
         ariaLabel: customAriaLabel,
-        testId: getTestId(el),
         nearestLandmark: getNearestLandmark(el)
       });
     });
@@ -594,12 +492,6 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
       if (t) modalPhrases.push(t);
     });
     if (modalPhrases.length > 10) modalPhrases = modalPhrases.slice(0, 10);
-    var testIds = [];
-    root.querySelectorAll('[data-testid], [data-test-id]').forEach(function(el) {
-      var id = el.getAttribute('data-testid') || el.getAttribute('data-test-id');
-      if (id && testIds.indexOf(id) === -1) testIds.push(id);
-    });
-    if (testIds.length > 50) testIds = testIds.slice(0, 50);
     return JSON.stringify({
       path: path,
       host: hostName,
@@ -612,11 +504,10 @@ export const DOM_PAGE_SUMMARY_SCRIPT = `
       ctas: ctas,
       formFields: formFields,
       navItems: navItems,
-      modalPhrases: modalPhrases,
-      testIds: testIds
+      modalPhrases: modalPhrases
     });
   } catch (e) {
-    return JSON.stringify({ path: '', title: null, h1: null, headings: [], ctas: [], formFields: [], navItems: [], modalPhrases: [], testIds: [], error: e.message });
+    return JSON.stringify({ path: '', title: null, h1: null, headings: [], ctas: [], formFields: [], navItems: [], modalPhrases: [], error: e.message });
   }
 })();
 `;

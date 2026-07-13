@@ -191,6 +191,11 @@ function buildScenarioFromRecorded(
       if (clickText) params.text = clickText;
       if (clickSelector) params.selector = clickSelector;
       if (log.context) params.context = log.context;
+      // 실행 매칭기와 대칭이 되도록 landmark/accessibleName도 저장(다음 단계에서 매칭에 활용).
+      if (log.nearestLandmark) params.nearestLandmark = log.nearestLandmark;
+      if (log.accessibleName && log.accessibleName !== clickText) {
+        params.accessibleName = log.accessibleName;
+      }
       const clickDesc = clickText
         ? `${clickText} 버튼을 클릭합니다.`
         : `${clickSelector} 요소를 클릭합니다.`;
