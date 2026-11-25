@@ -25,7 +25,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <Link
           to="/"
           className="flex items-center gap-2 group select-none h-7 pl-0.5"
-          aria-label="flux 홈"
+          aria-label="aflow 홈"
         >
           <img
             src={ICON_URL}
@@ -36,7 +36,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
           />
           <img
             src={LOGO_URL}
-            alt="flux"
+            alt="aflow"
             className="object-contain object-left"
             style={{ height: 34 }}
           />

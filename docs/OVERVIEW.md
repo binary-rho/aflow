@@ -1,7 +1,7 @@
-# flux — 프로젝트 개요 및 LLM 활용
+# aflow — 프로젝트 개요 및 LLM 활용
 
 > DRR(Design Review Request) 문서를 실행 가능한 시나리오로 바꾸고, 브라우저에서 자동 재생하는 **Chrome 확장 프로그램**입니다.
-> 이 문서는 사내 로컬 LLM을 활용하는 실제 사례로서 flux를 소개합니다.
+> 이 문서는 사내 로컬 LLM을 활용하는 실제 사례로서 aflow를 소개합니다.
 
 ---
 
@@ -54,7 +54,7 @@ flowchart TD
 
 ## 3. LLM 활용 — 지금, 그리고 앞으로
 
-flux에서 LLM은 두 성격이 다른 작업에 쓰인다. **OpenAI 호환 API(`/v1/chat/completions`)** 로 호출하므로, 사내 로컬 LLM(gemma 등)을 base URL·모델명만 바꿔 그대로 사용한다.
+aflow에서 LLM은 두 성격이 다른 작업에 쓰인다. **OpenAI 호환 API(`/v1/chat/completions`)** 로 호출하므로, 사내 로컬 LLM(gemma 등)을 base URL·모델명만 바꿔 그대로 사용한다.
 
 > 참고: 시나리오를 만드는 두 방법 중 **직접 생성(녹화)은 LLM을 쓰지 않는다**(브라우저 조작을 그대로 기록). LLM은 아래 ①②, 즉 **문서 변환 흐름과 재생 중 매칭**에서만 쓰인다.
 
@@ -148,7 +148,7 @@ pnpm run dev      # Vite dev 서버
 pnpm run build    # vite build + manifest.json → dist/
 ```
 
-빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드 → DevTools(F12) → **"flux"** 탭에서 사용.
+빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드 → DevTools(F12) → **"aflow"** 탭에서 사용.
 
 **LLM 설정**: 확장 설정에서 provider(로컬 LLM / GPT-4o / Claude) 선택 후, 로컬 LLM은 Base URL·Model ID를 입력한다. OpenAI 호환 엔드포인트면 그대로 연동된다.
 

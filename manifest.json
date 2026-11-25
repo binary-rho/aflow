@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "flux",
+  "name": "aflow",
   "version": "0.2.0",
   "description": "DRR 자동화 엔진 — DRR 문서를 DSL로 변환하고 브라우저에서 실행합니다.",
   "permissions": ["debugger", "activeTab", "storage", "tabs", "tabCapture", "sidePanel"],
@@ -12,7 +12,7 @@
     "https://digitalplatform-iop.cloud/*"
   ],
   "action": {
-    "default_title": "flux"
+    "default_title": "aflow"
   },
   "side_panel": {
     "default_path": "index.html"

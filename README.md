@@ -1,4 +1,4 @@
-# flux
+# aflow
 
 DRR(Design Review Request) 문서를 실행 가능한 시나리오로 변환하고, Chrome DevTools
 Protocol(CDP)로 브라우저에서 자동 실행하는 **Chrome 확장 프로그램**(Manifest V3, Side Panel).
@@ -11,13 +11,13 @@ pnpm run dev      # Vite dev 서버
 pnpm run build    # vite build + manifest.json → dist/
 ```
 
-빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드. DevTools(F12) → "flux" 탭에서 사용.
+빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드. DevTools(F12) → "aflow" 탭에서 사용.
 
 ---
 
 ## 동작 전략
 
-flux의 핵심 난제는 **"녹화/변환 시점의 화면"과 "재생 시점의 화면"이 다르다**는 것이다.
+aflow의 핵심 난제는 **"녹화/변환 시점의 화면"과 "재생 시점의 화면"이 다르다**는 것이다.
 요금제 목록이 선택에 따라 개수가 바뀌고, 모달/바텀시트가 동적으로 뜨고, API 응답이 늦게
 오고, Vue가 매번 `_uid_` id를 다시 매긴다. 아래 전략들은 모두 이 간극을 메우기 위한 것이다.
 

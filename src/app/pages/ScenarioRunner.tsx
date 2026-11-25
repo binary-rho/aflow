@@ -56,7 +56,7 @@ function isContextInvalidated(err: unknown): boolean {
 
 function showContextInvalidatedAlert(): void {
   alert(
-    "확장 프로그램이 새로고침된 것 같습니다.\n\n개발자 도구를 닫았다가 다시 열고, flux 탭을 다시 클릭해주세요.",
+    "확장 프로그램이 새로고침된 것 같습니다.\n\n개발자 도구를 닫았다가 다시 열고, aflow 탭을 다시 클릭해주세요.",
   );
 }
 
@@ -606,7 +606,7 @@ export default function ScenarioRunner() {
       <div className="p-6 text-center text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg mx-4 mt-4">
         <p className="font-semibold mb-2">확장 컨텍스트가 만료되었습니다.</p>
         <p className="text-gray-600">
-          개발자 도구를 닫았다가 다시 열고, flux 탭을 다시 클릭해주세요.
+          개발자 도구를 닫았다가 다시 열고, aflow 탭을 다시 클릭해주세요.
         </p>
       </div>
     );
@@ -718,7 +718,7 @@ export default function ScenarioRunner() {
               <p className="mt-1">{lastError}</p>
               {lastError.includes("일반 웹페이지") && (
                 <p className="mt-2 text-xs text-red-600">
-                  개발자 도구를 열고, 주소창이 https:// 로 시작하는 일반 웹페이지 탭을 먼저 선택한 뒤 flux에서 실행해주세요.
+                  개발자 도구를 열고, 주소창이 https:// 로 시작하는 일반 웹페이지 탭을 먼저 선택한 뒤 aflow에서 실행해주세요.
                 </p>
               )}
             </div>

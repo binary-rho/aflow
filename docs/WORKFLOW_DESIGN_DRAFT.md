@@ -1,4 +1,4 @@
-# flux Workflow Builder Draft
+# aflow Workflow Builder Draft
 
 ## 목적
 

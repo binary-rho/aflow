@@ -1,8 +1,8 @@
-# flux - 개발 문서
+# aflow - 개발 문서
 
 ## 1. 프로젝트 개요
 
-flux는 DRR(Design Review Request) 문서를 실행 가능한 시나리오로 변환하고, Chrome DevTools Protocol(CDP)을 통해 브라우저에서 자동 실행하는 Chrome 확장 프로그램입니다.
+aflow는 DRR(Design Review Request) 문서를 실행 가능한 시나리오로 변환하고, Chrome DevTools Protocol(CDP)을 통해 브라우저에서 자동 실행하는 Chrome 확장 프로그램입니다.
 
 ### 핵심 기능
 
@@ -314,7 +314,7 @@ pnpm build
 1. `chrome://extensions` 접속
 2. "개발자 모드" 활성화
 3. "압축해제된 확장 프로그램을 로드합니다" -> `dist/` 폴더 선택
-4. 개발자 도구(F12) -> "flux" 탭에서 사용
+4. 개발자 도구(F12) -> "aflow" 탭에서 사용
 
 ### manifest.json 권한
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-flux는 DRR(Design Review Request) 문서를 실행 가능한 시나리오로 변환하고, Chrome DevTools Protocol(CDP)을 통해 브라우저에서 자동 실행하는 **Chrome 확장 프로그램**(Manifest V3, Side Panel)입니다.
+aflow는 DRR(Design Review Request) 문서를 실행 가능한 시나리오로 변환하고, Chrome DevTools Protocol(CDP)을 통해 브라우저에서 자동 실행하는 **Chrome 확장 프로그램**(Manifest V3, Side Panel)입니다.
 
 ## Build & Dev Commands
 
@@ -14,7 +14,7 @@ pnpm run dev          # Vite dev server
 pnpm run build        # vite build + manifest.json → dist/ 복사
 ```
 
-빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드. DevTools(F12) → "flux" 탭에서 사용.
+빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드. DevTools(F12) → "aflow" 탭에서 사용.
 
 테스트 프레임워크는 아직 설정되어 있지 않습니다.
 

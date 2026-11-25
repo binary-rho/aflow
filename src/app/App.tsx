@@ -42,7 +42,7 @@ class ErrorBoundary extends Component<
             확장 프로그램이 새로고침되었습니다
           </p>
           <p style={{ color: "#555", margin: 0 }}>
-            개발자 도구를 <strong>닫았다가 다시 열고</strong>, flux 탭을 다시 클릭해주세요.
+            개발자 도구를 <strong>닫았다가 다시 열고</strong>, aflow 탭을 다시 클릭해주세요.
           </p>
         </div>
       );
