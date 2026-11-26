@@ -1,3 +1,9 @@
+nodeLinker: hoisted
+
+overrides:
+  vite: 6.3.5
+
+# 설치 스크립트(postinstall) 실행 허용 여부. 둘 다 Vite/Tailwind 빌드에 쓰는 네이티브 바이너리 패키지.
 allowBuilds:
-  '@tailwindcss/oxide': set this to true or false
-  esbuild: set this to true or false
+  '@tailwindcss/oxide': true
+  esbuild: true
