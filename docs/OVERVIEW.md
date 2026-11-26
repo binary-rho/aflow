@@ -7,12 +7,12 @@
 
 ## 1. 개요
 
-- **플랫폼**: Chrome Extension (Manifest V3, DevTools Side Panel)
+- **플랫폼**: Chrome Extension (Manifest V3, Side Panel)
 - **브라우저 제어**: Chrome DevTools Protocol(CDP)
 - **LLM 활용**:
    - 자연어 →  구조화된 테스트 시나리오 변환
    - 실행 중 DOM 요소 매칭 및 판단
-- **기술 스택**: React 19, TypeScript, Vite, Tailwind CSS 4, Radix UI, React Flow
+- **기술 스택**: React 18, TypeScript, Vite, Tailwind CSS 4, Radix UI, React Flow
 - **데이터 저장**: localStorage, chrome.storage (서버 DB 미사용)
 
 **해결하는 문제**: 디자인/기획이 작성한 리뷰 문서를 사람이 매번 손으로 클릭하며 확인하는 대신, 문서를 그대로 **자동 재생**해 시연·검증한다. 반복 데모와 회귀 확인의 수작업을 없애는 것이 목적이다.
@@ -134,7 +134,7 @@ stores/ (localStorage / chrome.storage)
 - [ ] 시나리오 조합 기능 강화
    - 여러 시나리오를 이어 붙여 하나의 플로우로 실행. 그래프 편집·분기 UX 안정화
 - [ ] 주소별 시나리오 확인
-   - 현재는 검사 탭이 해당 주소에 있어야 시나리오가 목록에 보임(host+경로 필터). 주소로 이동하지 않고도 도메인 무관하게 조회·관리할 수 있게 개선
+   - 현재는 활성 탭이 해당 주소에 있어야 시나리오가 목록에 보임(host+경로 필터). 주소로 이동하지 않고도 도메인 무관하게 조회·관리할 수 있게 개선
 - [ ] Confluence MCP 연동 및 문서 자동 변환 (최종 목표)
    - Confluence MCP로 DRR 문서를 직접 읽어와, 복붙 없이 LLM이 곧바로 시나리오로 변환
 
@@ -146,9 +146,10 @@ stores/ (localStorage / chrome.storage)
 pnpm install      # 의존성 설치
 pnpm run dev      # Vite dev 서버
 pnpm run build    # vite build + manifest.json → dist/
+pnpm test         # vitest 단위 테스트
 ```
 
-빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드 → DevTools(F12) → **"aflow"** 탭에서 사용.
+빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드 → 툴바의 aflow 아이콘 → **Side Panel**에서 사용.
 
 **LLM 설정**: 확장 설정에서 provider(로컬 LLM / GPT-4o / Claude) 선택 후, 로컬 LLM은 Base URL·Model ID를 입력한다. OpenAI 호환 엔드포인트면 그대로 연동된다.
 

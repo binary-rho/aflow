@@ -68,7 +68,7 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition> = {
   'nav.app_load_url':      { id: 'nav.app_load_url', name: '앱 URL 로드', description: 'AppBridge.pluginLoadUrl로 앱 웹뷰에서 URL을 직접 로드합니다.', status: 'missing', params: ['contextName', 'url'] },
 
   // ── auth.* (16) ─────────────────────────────────────────────────────────
-  'auth.login':            { id: 'auth.login', name: '일반 로그인', description: 'ID/비밀번호로 로그인합니다.', status: 'implemented', params: ['userId', 'password', 'loginType'] },
+  'auth.login':            { id: 'auth.login', name: '일반 로그인', description: 'ID/비밀번호로 로그인합니다.', status: 'missing', params: ['userId', 'password', 'loginType'] },
   'auth.logout':           { id: 'auth.logout', name: '로그아웃', description: '세션을 종료하고 로그아웃합니다.', status: 'missing', params: [] },
   'auth.sns_login':        { id: 'auth.sns_login', name: 'SNS 소셜 로그인', description: 'SNS 계정(카카오, 네이버 등)으로 로그인합니다.', status: 'missing', params: ['snsType', 'accessToken'] },
   'auth.app_login':        { id: 'auth.app_login', name: '앱 자동 로그인', description: '앱 환경에서 저장된 인증정보로 자동 로그인합니다.', status: 'missing', params: [] },
@@ -76,7 +76,7 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition> = {
   'auth.simple_login':     { id: 'auth.simple_login', name: '간편 로그인', description: '간편 인증 후 로그인합니다.', status: 'missing', params: ['authData'] },
   'auth.second_login':     { id: 'auth.second_login', name: '2차 인증 로그인', description: '2차 인증(비밀번호 재확인)을 수행합니다.', status: 'missing', params: ['password'] },
   'auth.oauth2_login':     { id: 'auth.oauth2_login', name: 'OAuth2 로그인', description: 'OAuth2 프로토콜을 통한 로그인 및 세션 검증을 수행합니다.', status: 'missing', params: ['redirectUrl'] },
-  'auth.signup':           { id: 'auth.signup', name: '회원가입', description: '회원가입을 수행합니다.', status: 'implemented', params: [] },
+  'auth.signup':           { id: 'auth.signup', name: '회원가입', description: '회원가입을 수행합니다.', status: 'missing', params: [] },
   'auth.verify_real_name': { id: 'auth.verify_real_name', name: '실명 본인인증', description: '실명(KYC) 인증을 수행합니다.', status: 'missing', params: ['name', 'sid', 'phoneNumber', 'certType'] },
   'auth.phone_cert':       { id: 'auth.phone_cert', name: '휴대폰 본인인증', description: '휴대폰 인증번호 발송/확인을 통해 본인인증합니다.', status: 'missing', params: ['phoneNumber', 'certificationNumber'] },
   'auth.ipin_cert':        { id: 'auth.ipin_cert', name: 'IPIN 인증', description: 'IPIN 팝업을 열어 본인인증합니다.', status: 'missing', params: [] },

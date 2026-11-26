@@ -12,6 +12,7 @@ import {
   clearLastRunDomSnapshots,
 } from "./stores/domCaptureStore";
 import * as cdp from "./engine/cdp";
+import { applyLlmRuntimeConfig, type LlmRuntimeConfig } from "./stores/settingsStore";
 
 type MessageType =
   | { type: "PING" }
@@ -29,6 +30,8 @@ type MessageType =
       validationOnly?: boolean;
       apiKey?: string;
       llmProvider?: string;
+      /** UI의 LLM 설정 스냅샷 (SW에는 localStorage가 없어 메시지로 전달) */
+      llmConfig?: Partial<LlmRuntimeConfig>;
       startFromIndex?: number;
     }
   | { type: "START_RECORDING"; tabId: number }
@@ -367,8 +370,10 @@ chrome.runtime.onMessage.addListener(
       }
 
       case "RUN_SCENARIO": {
-        const { scenario, scenarios, tabId, stepDelayMs, validationOnly, apiKey, llmProvider, startFromIndex } =
+        const { scenario, scenarios, tabId, stepDelayMs, validationOnly, apiKey, llmProvider, llmConfig, startFromIndex } =
           message;
+        // SW에는 localStorage가 없으므로 UI가 보낸 설정으로 매처/LLM getter를 덮어쓴다.
+        applyLlmRuntimeConfig(llmConfig);
         const chain =
           scenarios && scenarios.length > 0 ? scenarios : [scenario];
         function broadcastStatus(state: unknown) {

@@ -11,7 +11,9 @@ export function normalizeForMatch(s: string | null | undefined): string {
   return (s ?? "")
     .trim()
     .replace(/\s+/g, "")
-    .replace(/[⁺\u2B⁺]/g, "+")
+    // 위첨자 플러스(U+207A)만 '+'로 통일. (예전 `[⁺\u2B⁺]`는 `\u2B`가 4자리 이스케이프가 아니어서
+    // 문자 u/2/B까지 '+'로 바꾸는 버그가 있었다.)
+    .replace(/⁺/g, "+")
     .toLowerCase();
 }
 
@@ -96,7 +98,7 @@ export function buildClientNormalizerScript(): string {
       return (s == null ? '' : String(s))
         .trim()
         .replace(/\\s+/g, '')
-        .replace(/[\\u207A\\u2B\\u207A]/g, '+')
+        .replace(/\\u207A/g, '+')
         .toLowerCase();
     };
     var fluxNormalizeWithSpaces = function(s) {

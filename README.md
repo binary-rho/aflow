@@ -9,9 +9,10 @@ Protocol(CDP)로 브라우저에서 자동 실행하는 **Chrome 확장 프로�
 pnpm install      # 의존성 설치
 pnpm run dev      # Vite dev 서버
 pnpm run build    # vite build + manifest.json → dist/
+pnpm test         # vitest 단위 테스트
 ```
 
-빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드. DevTools(F12) → "aflow" 탭에서 사용.
+빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드. 툴바의 aflow 아이콘을 클릭하면 Side Panel이 열립니다.
 
 ---
 
@@ -81,4 +82,4 @@ DOM이 잠깐 조용한 것을 "완료"로 오판하면, 아직 안 뜬 화면�
 
 레이어 구조·데이터 흐름·액션 레지스트리 등 상세는 [`CLAUDE.md`](./CLAUDE.md) 참고.
 
-테스트 프레임워크는 아직 설정되어 있지 않다.
+단위 테스트는 vitest로 실행한다 (`pnpm test`, 감시 모드는 `pnpm test:watch`). 브라우저/CDP가 필요 없는 순수 로직(`*.test.ts`)만 대상이며, 실제 페이지 조작(CDP, 모달 인식 등)은 확장을 로드해 직접 확인해야 한다.

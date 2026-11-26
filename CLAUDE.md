@@ -12,11 +12,12 @@ aflow는 DRR(Design Review Request) 문서를 실행 가능한 시나리오로 �
 pnpm install          # 의존성 설치
 pnpm run dev          # Vite dev server
 pnpm run build        # vite build + manifest.json → dist/ 복사
+pnpm test             # vitest 단위 테스트 (순수 로직)
 ```
 
-빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드. DevTools(F12) → "aflow" 탭에서 사용.
+빌드 후 `chrome://extensions` → 개발자 모드 → `dist/` 폴더 로드. 툴바의 aflow 아이콘을 클릭하면 Side Panel이 열립니다.
 
-테스트 프레임워크는 아직 설정되어 있지 않습니다.
+단위 테스트는 vitest로 실행합니다 (`pnpm test`, 감시 모드는 `pnpm test:watch`). 브라우저/CDP가 필요 없는 순수 로직(`src/**/*.test.ts`)만 대상이며, 실제 페이지 조작은 확장을 로드해 직접 확인해야 합니다.
 
 ## Architecture
 
@@ -69,7 +70,7 @@ Panel ↔ Service Worker 간 `chrome.runtime.sendMessage()` 기반 메시지 통
 
 ## Action Registry
 
-164개 액션 중 30개 구현. 새 액션 추가 시:
+167개 액션 정의 중 27개 구현 (`data.ts` 기준). 새 액션 추가 시:
 
 1. `src/app/data.ts`의 `ACTION_REGISTRY`에서 `status: 'missing'`인 액션 확인
 2. `src/actions/` 하위에 실행 함수 구현

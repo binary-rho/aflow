@@ -12,6 +12,10 @@ import {
 
 const ICON_URL = `${import.meta.env.BASE_URL}icons/Icon.png`;
 const LOGO_URL = `${import.meta.env.BASE_URL}icons/logo.png`;
+// logo.png 원본 231x63 비율 유지. 크기를 바꾸려면 높이만 조절하고 너비는 높이 × (231/63)로 맞출 것.
+const LOGO_HEIGHT = 16;
+const ICON_SIZE = 28;
+const LOGO_WIDTH = Math.round((LOGO_HEIGHT * 231) / 63);
 
 export function Layout({ children }: { children: React.ReactNode }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -31,14 +35,16 @@ export function Layout({ children }: { children: React.ReactNode }) {
             src={ICON_URL}
             alt=""
             className="shrink-0 object-contain"
-            width={26}
-            height={26}
+            width={ICON_SIZE}
+            height={ICON_SIZE}
           />
           <img
             src={LOGO_URL}
             alt="aflow"
-            className="object-contain object-left"
-            style={{ height: 34 }}
+            className="shrink-0 object-contain object-left"
+            width={LOGO_WIDTH}
+            height={LOGO_HEIGHT}
+            style={{ width: LOGO_WIDTH, height: LOGO_HEIGHT }}
           />
         </Link>
         <div className="flex items-center gap-1">

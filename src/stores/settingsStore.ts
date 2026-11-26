@@ -88,8 +88,44 @@ export function getApiKey(): string | null {
   return getApiKeyForProvider(getLlmProvider());
 }
 
+/**
+ * LLM 런타임 설정 스냅샷.
+ *
+ * 시나리오 실행(runner/domMatcher)은 MV3 Service Worker에서 돌고, SW에는
+ * localStorage가 없다. 그래서 UI(패널)가 RUN_SCENARIO 메시지에 이 스냅샷을 실어
+ * 보내고, SW는 applyLlmRuntimeConfig()로 적용한다. 적용된 값은 아래 getter들이
+ * localStorage보다 우선해서 쓴다. (UI 컨텍스트에서는 override가 null → 기존 동작)
+ */
+export interface LlmRuntimeConfig {
+  anthropicBaseUrl: string;
+  localBaseUrl: string;
+  localModel: string;
+  matcherEnabled: boolean;
+}
+
+let runtimeOverride: Partial<LlmRuntimeConfig> | null = null;
+
+/** UI 컨텍스트에서 현재 저장된 설정을 스냅샷으로 읽는다. SW로 보낼 때 사용. */
+export function readLlmRuntimeConfig(): LlmRuntimeConfig {
+  return {
+    anthropicBaseUrl: getAnthropicBaseUrl(),
+    localBaseUrl: getLocalBaseUrl(),
+    localModel: getLocalModel(),
+    matcherEnabled: getLlmMatcherEnabled(),
+  };
+}
+
+/** SW에서 실행 시작 시 호출. null/undefined면 override 해제. */
+export function applyLlmRuntimeConfig(
+  config: Partial<LlmRuntimeConfig> | null | undefined,
+): void {
+  runtimeOverride = config ?? null;
+}
+
 /** Anthropic 호출에 쓸 base URL. 비어있으면 공식 endpoint. 끝 슬래시는 정규화한다. */
 export function getAnthropicBaseUrl(): string {
+  const overridden = runtimeOverride?.anthropicBaseUrl?.trim();
+  if (overridden) return overridden.replace(/\/+$/, "");
   if (typeof localStorage === "undefined") return DEFAULT_ANTHROPIC_BASE_URL;
   const raw = (localStorage.getItem(ANTHROPIC_BASE_URL_STORAGE) || "").trim();
   if (!raw) return DEFAULT_ANTHROPIC_BASE_URL;
@@ -122,6 +158,8 @@ export function normalizeLocalBaseUrl(raw: string): string {
 }
 
 export function getLocalBaseUrl(): string {
+  const overridden = runtimeOverride?.localBaseUrl?.trim();
+  if (overridden) return normalizeLocalBaseUrl(overridden);
   if (typeof localStorage === "undefined") return DEFAULT_LOCAL_BASE_URL;
   const raw = (localStorage.getItem(LOCAL_BASE_URL_STORAGE) || "").trim();
   if (!raw) return DEFAULT_LOCAL_BASE_URL;
@@ -142,6 +180,8 @@ export function setLocalBaseUrl(url: string): void {
  * 사용자가 직접 지정할 수 있어야 한다. 비우면 기본값(gemma4:26b).
  */
 export function getLocalModel(): string {
+  const overridden = runtimeOverride?.localModel?.trim();
+  if (overridden) return overridden;
   if (typeof localStorage === "undefined") return DEFAULT_LOCAL_MODEL;
   const raw = (localStorage.getItem(LOCAL_MODEL_STORAGE) || "").trim();
   return raw || DEFAULT_LOCAL_MODEL;
@@ -160,6 +200,9 @@ export { DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL };
 
 /** LLM 매처(AI fallback) 사용 여부. 기본값은 켜짐. */
 export function getLlmMatcherEnabled(): boolean {
+  if (typeof runtimeOverride?.matcherEnabled === "boolean") {
+    return runtimeOverride.matcherEnabled;
+  }
   if (typeof localStorage === "undefined") return true;
   const raw = localStorage.getItem(LLM_MATCHER_ENABLED_STORAGE);
   if (raw === "0" || raw === "false") return false;

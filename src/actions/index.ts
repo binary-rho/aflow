@@ -1,5 +1,4 @@
 import { gotoAction, waitAction, scrollToAction, scrollByAction } from "./navigation";
-import { loginAction, signupAction } from "./auth";
 import { clickButtonAction, fillFormAction, gnbClickLoginAction, hoverAction, selectOptionAction, selectDropdownAction, checkAction, keypressAction } from "./interaction";
 import {
   assertVisibleAction,
@@ -40,8 +39,6 @@ const registry: Record<string, ActionFn> = {
   "nav.wait": waitAction,
   "scroll.to": scrollToAction,
   "scroll.by": scrollByAction,
-  "auth.login": loginAction,
-  "auth.signup": signupAction,
   "button.click": clickButtonAction,
   "button.link_click": clickButtonAction,
   "button.cta_click": clickButtonAction,

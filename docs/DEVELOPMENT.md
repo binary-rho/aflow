@@ -6,11 +6,11 @@ aflow는 DRR(Design Review Request) 문서를 실행 가능한 시나리오로 �
 
 ### 핵심 기능
 
-- **DRR-to-DSL 변환**: 자연어 시나리오 입력을 LLM(GPT-4o-mini)으로 구조화된 DSL로 변환
-- **시나리오 자동 실행**: CDP를 통해 검사 중인 탭에서 클릭, 입력, 네비게이션 등을 자동 수행
+- **DRR-to-DSL 변환**: 자연어 시나리오 입력을 LLM(로컬 LLM / GPT-4o / Claude 중 선택)으로 구조화된 DSL로 변환
+- **시나리오 자동 실행**: CDP를 통해 대상 탭(Side Panel이 열린 창의 활성 탭)에서 클릭, 입력, 네비게이션 등을 자동 수행
 - **직접 생성 (녹화)**: 사용자의 실제 브라우저 조작을 캡처하여 시나리오로 변환
 - **검증 모드**: 실제 클릭/입력 없이 각 스텝의 요소 존재 여부만 순차 검증
-- **화면 녹화**: 시나리오 실행 중 검사 탭의 화면을 녹화하여 파일로 저장
+- **화면 녹화**: 시나리오 실행 중 대상 탭의 화면을 녹화하여 파일로 저장
 
 ### 기술 스택
 
@@ -18,11 +18,12 @@ aflow는 DRR(Design Review Request) 문서를 실행 가능한 시나리오로 �
 |------|------|
 | 런타임/빌드 | Vite 6, TypeScript |
 | UI | React 18, Tailwind CSS 4, Radix UI |
-| 라우팅 | react-router 7 |
+| 라우팅 | react-router 7 (Hash Router) |
+| 플로우 캔버스 | @xyflow/react |
 | 아이콘 | lucide-react |
-| LLM | OpenAI API (gpt-4o-mini) |
+| LLM | 로컬/사내 LLM(OpenAI 호환), OpenAI(gpt-4o, 매처는 gpt-4o-mini), Anthropic(Claude, 사내 게이트웨이 지원) |
 | 브라우저 자동화 | Chrome DevTools Protocol (chrome.debugger) |
-| 상태 저장 | localStorage |
+| 상태 저장 | `localStorage`(시나리오·설정·플로우, 패널에서 접근) + `chrome.storage`(selector 캐시·DOM 스냅샷, Service Worker에서 접근) |
 
 ---
 
@@ -32,40 +33,58 @@ aflow는 DRR(Design Review Request) 문서를 실행 가능한 시나리오로 �
 
 ```
 src/
+├── background.ts         # Service Worker: 메시지 허브 (실행/녹화/제어, 녹화 → 시나리오 변환)
 ├── actions/              # 실행 가능한 액션 구현체
-│   ├── index.ts          # 액션 레지스트리 (이름 -> 함수 매핑)
-│   ├── navigation.ts     # nav.goto, nav.wait, scroll.to
-│   ├── interaction.ts    # button.click, form.fill, form.check, hover, keypress
-│   ├── auth.ts           # auth.login, auth.signup
-│   └── assertion.ts      # assert.visible, assert.hidden, assert.text
+│   ├── index.ts          # 액션 레지스트리 (이름 -> 함수 매핑, 별칭 포함)
+│   ├── navigation.ts     # nav.goto, nav.wait, scroll.to, scroll.by
+│   ├── interaction.ts    # button.click, form.fill/check/select/select_dropdown, hover, keypress, gnb.clickLogin
+│   ├── assertion.ts      # assert.visible, assert.hidden, assert.text, assert.url
+│   └── auth.ts           # (미사용) auth.login/signup 스텁 — 레지스트리에 등록되어 있지 않음
 ├── engine/               # 핵심 엔진
-│   ├── cdp.ts            # Chrome DevTools Protocol 래퍼
-│   ├── runner.ts          # 시나리오 실행 엔진 (스텝 순차 실행, 새 탭 전환)
+│   ├── cdp.ts            # CDP 래퍼 (attach 참조 카운팅, 대기 전략, 클릭/입력/스크롤 프리미티브)
+│   ├── runner.ts         # 시나리오 실행 엔진 (스텝 순차 실행, 체인 실행, 새 탭 전환)
 │   ├── recorder.ts       # 사용자 조작 녹화 (이벤트 수집, 스크립트 주입)
-│   └── actionRegistry.ts # 액션 실행 위임
-├── services/             # 외부 서비스 연동
-│   ├── llm.ts            # OpenAI API 호출, DRR->DSL 변환 프롬프트
-│   ├── domSnapshot.ts    # 페이지 DOM 요약 수집 스크립트
-│   └── domMatcher.ts     # DOM 요소 텍스트 매칭 (한영 동의어 포함)
-├── stores/               # localStorage 기반 저장소
-│   ├── scenarioStore.ts  # 시나리오 CRUD
-│   ├── groupsStore.ts    # 시나리오 그룹 관리
-│   ├── settingsStore.ts  # API 키, 속도 프리셋
-│   └── domCaptureStore.ts # 실행 중 DOM 캡처
-├── app/                  # UI 레이어
-│   ├── pages/
-│   │   ├── ScenarioList.tsx   # 메인: 시나리오 목록, DRR 입력, 녹화
-│   │   ├── ScenarioRunner.tsx # 시나리오 실행 화면
-│   │   └── ActionRegistry.tsx # 액션 도감
-│   └── components/
-│       ├── Layout.tsx         # 헤더 (아이콘 + 로고)
-│       ├── ScenarioCard.tsx   # 시나리오 카드 (검증 버튼 포함)
-│       ├── DrrInputBox.tsx    # DRR 입력 + 토큰 칩 UI
-│       ├── DrrResultView.tsx  # 변환 결과 DSL 뷰
-│       └── SettingsModal.tsx  # API 키 설정
-├── background.ts         # Service Worker (시나리오 실행/녹화 메시지 핸들링)
-└── hooks/
-    └── useInspectedTabUrl.ts  # 검사 탭 URL 실시간 추적
+│   └── actionRegistry.ts # 액션 실행 위임 (StepResult 생성)
+├── services/             # 요소 매칭 / LLM / DOM 요약
+│   ├── llm.ts            # DRR -> DSL 변환 (로컬/OpenAI/Anthropic, 시스템 프롬프트, 토큰 파싱)
+│   ├── intentDsl.ts      # DSL <-> IntentScenario 어댑터 (의도 기반 중간 표현)
+│   ├── domSnapshot.ts    # 페이지 DOM 요약 수집 (CTA·폼·셀렉터, PII 마스킹)
+│   ├── domMatcher.ts     # 요소 매칭: 캐시 -> fast path -> LLM 후보 선택
+│   ├── targetResolver.ts # 클릭/호버/입력 대상 해결 사다리 (selector -> matcher -> text+context -> text)
+│   ├── scopeResolver.ts  # 활성 모달/바텀시트 스코프 판별 (탐지·실행 공용)
+│   ├── textMatch.ts      # 텍스트 정규화·매칭 (한영 동의어)
+│   ├── contextExtractor.ts # 요소 주변 컨텍스트 추출 스크립트 (녹화/실행 공용)
+│   └── urlMatch.ts       # URL 비교 (같은 페이지 판단, 시나리오 시작 URL)
+├── stores/               # 저장소
+│   ├── scenarioStore.ts  # 시나리오 CRUD                       (localStorage)
+│   ├── groupsStore.ts    # 시나리오 그룹 관리                  (localStorage)
+│   ├── settingsStore.ts  # LLM 설정·API 키·속도 프리셋         (localStorage, SW에는 메시지로 전달)
+│   ├── flowCompositionStore.ts # 플로우 그래프(노드+엣지)      (localStorage)
+│   ├── selectorCacheStore.ts   # 성공 selector 학습 캐시       (chrome.storage.local)
+│   └── domCaptureStore.ts      # 마지막 실행의 DOM 스냅샷      (chrome.storage.session)
+├── lib/                  # 순수 유틸
+│   ├── scenarioChain.ts  # followUp 체인 펼치기
+│   ├── flowLinearPath.ts # 플로우 그래프 -> 선형 시나리오 순서
+│   ├── scenarioHost.ts   # 시나리오 urlPattern / 탭 호스트 비교
+│   └── utils.ts
+├── hooks/
+│   ├── useActiveTabId.ts      # 활성 탭 ID 조회
+│   └── useInspectedTabUrl.ts  # 대상 탭 URL 실시간 추적
+└── app/                  # UI 레이어 (Side Panel, React)
+    ├── routes.ts         # Hash Router 정의
+    ├── data.ts           # 타입(Scenario 등) + ACTION_REGISTRY 정의
+    ├── pages/
+    │   ├── ScenarioList.tsx     # 메인: 시나리오 목록, DRR 입력, 녹화, 검증
+    │   ├── ScenarioRunner.tsx   # 시나리오 실행 화면
+    │   ├── ScenarioFlowPage.tsx # 플로우 빌더 캔버스
+    │   ├── FlowDetailPage.tsx   # 플로우 상세·실행
+    │   └── ActionRegistry.tsx   # 액션 도감
+    └── components/
+        ├── Layout.tsx, ScenarioCard.tsx, DraggableScenarioCard.tsx
+        ├── DrrInputBox.tsx, DrrResultView.tsx, DrrThinkingView.tsx
+        ├── SettingsModal.tsx    # LLM·키·속도 설정
+        ├── flow/                # 플로우 캔버스 노드·레이아웃
+        └── ui/                  # shadcn/Radix 기반 UI (button, select, dropdown-menu, tooltip)
 ```
 
 ### 2.2 데이터 흐름
@@ -86,7 +105,7 @@ RecordedEvent[] ──> background.ts ──>   시나리오 실행 (runner.ts)
                                     CDP (cdp.ts) ──> 브라우저 탭
 ```
 
-### 2.3 메시지 프로토콜 (DevTools Panel <-> Service Worker)
+### 2.3 메시지 프로토콜 (Side Panel <-> Service Worker)
 
 | 메시지 타입 | 방향 | 설명 |
 |------------|------|------|
@@ -95,6 +114,13 @@ RecordedEvent[] ──> background.ts ──>   시나리오 실행 (runner.ts)
 | `START_RECORDING` | Panel -> SW | 녹화 시작 |
 | `STOP_RECORDING` | Panel -> SW | 녹화 종료 + 시나리오 반환 |
 | `PAUSE` / `RESUME` / `CANCEL` | Panel -> SW | 실행 제어 |
+| `GET_ACTIVE_TAB_URL` / `GET_INSPECTED_TAB_URL` / `NAVIGATE_ACTIVE_TAB` | Panel -> SW | 대상 탭 URL 조회·이동 |
+| `EVAL_DOM_SCRIPT` | Panel -> SW | 대상 탭에서 스크립트 평가 (DOM 요약 수집 등) |
+| `GET_TAB_CAPTURE_STREAM_ID` | Panel -> SW | 화면 녹화용 tabCapture 스트림 ID |
+
+> **주의**: Service Worker에는 `localStorage`가 없습니다. 그래서 `RUN_SCENARIO`는 `apiKey`, `llmProvider`와 함께
+> `llmConfig`(로컬 Base URL·모델, Anthropic 게이트웨이, LLM 매처 사용 여부)를 실어 보내고,
+> SW는 `applyLlmRuntimeConfig()`로 적용합니다. 실행 중 사용하는 새 설정값이 생기면 이 메시지에 추가해야 합니다.
 
 ---
 
@@ -104,20 +130,26 @@ RecordedEvent[] ──> background.ts ──>   시나리오 실행 (runner.ts)
 
 ### 3.1 레지스트리 현황
 
-실제 서비스 레포(Nuxt 2 + Vue 2 + Bootstrap-Vue, ~1,253 라우트)에서 추출한 **147개** 액션을 9개 카테고리로 정리했습니다.
+실제 서비스 레포(Nuxt 2 + Vue 2 + Bootstrap-Vue, ~1,253 라우트)에서 추출한 **167개** 액션 정의를 정리했습니다. (`app/data.ts`의 `ACTION_REGISTRY`)
 
 | 카테고리 | 전체 | 구현됨 | 주요 소스 |
 |----------|------|--------|-----------|
 | `nav.*` | 18 | 2 | LinkUtil, $router, AppBridge, 미들웨어 |
-| `auth.*` | 17 | 2 | LoginUtil, AppLoginUtil, verifyRealName, OAuth2 |
-| `button.*` | 20 | 5 | BxButton, BxLink, BxDialog, GNB/LNB |
+| `auth.*` | 17 | 0 | LoginUtil, AppLoginUtil, verifyRealName, OAuth2 |
+| `button.*` | 19 | 1 | BxButton, BxLink, BxDialog, GNB/LNB |
+| `gnb.*` | 1 | 1 | GNB 로그인 버튼 |
 | `form.*` | 23 | 7 | BxInput*, BxDatePicker, BxFile, VeeValidate |
 | `interaction.*` | 21 | 1 | BxDialog, BxBottomSheet, bx-accordion, bx-tab, Swiper |
 | `keyboard.*` | 8 | 5 | @keyup.enter, @keydown, @keypress |
-| `scroll.*` | 7 | 1 | scrollTo, bx-pagination, scrollToSection |
-| `assert.*` | 21 | 7 | 자동화 테스트용 검증 액션 |
-| `service.*` | 29 | 0 | 결제, 가입, 장바구니, 상담, 데이터, 로밍 등 |
-| **합계** | **164** | **30** | |
+| `scroll.*` | 8 | 2 | scrollTo, bx-pagination, scrollToSection |
+| `assert.*` | 21 | 8 | 자동화 테스트용 검증 액션 |
+| `service.*` | 31 | 0 | 결제, 가입, 장바구니, 상담, 데이터, 로밍 등 |
+| **합계** | **167** | **27** | |
+
+> 위 "구현됨"은 `data.ts`에서 `status: 'implemented'`인 개수이며, LLM 프롬프트의 액션 카탈로그는 이 값을 기준으로 생성됩니다.
+> 코드(`actions/index.ts`)에는 별칭을 포함해 32개가 등록되어 있습니다. 차이 5개(`button.link_click`, `button.cta_click`,
+> `button.banner_click`, `form.input_password`, `form.input_number`)는 실행은 가능하지만 `data.ts`에서는 아직 `missing`입니다.
+> `auth.login` / `auth.signup`은 스텁뿐이라 레지스트리에서 제외했고, 실행하면 `skipped (Not implemented)`로 보고됩니다.
 
 구현된 액션 중 일부는 에일리어스(동일 구현체를 다른 ID로 매핑)입니다.
 예: `form.input_text` -> `form.fill` 구현체 재사용, `keyboard.enter` -> `keyboard.press` 구현체 재사용.
@@ -131,11 +163,13 @@ RecordedEvent[] ──> background.ts ──>   시나리오 실행 (runner.ts)
 | `button.link_click`, `button.cta_click`, `button.banner_click` | `button.click` | `clickButtonAction` |
 | `form.input_text`, `form.input_password`, `form.input_number` | `form.fill` | `fillFormAction` |
 | `form.checkbox_check`, `form.radio_select` | `form.check` | `checkAction` |
-| `form.select_dropdown` | `form.select` | `selectOptionAction` |
 | `keyboard.enter`, `keyboard.escape`, `keyboard.tab`, `keyboard.keydown` | `keyboard.press` | `keypressAction` |
 | `assert.element_visible` | `assert.visible` | `assertVisibleAction` |
-| `assert.element_hidden` | `assert.hidden` | `assertHiddenAction` |
+| `assert.element_hidden`, `assert.elementHidden` | `assert.hidden` | `assertHiddenAction` |
 | `assert.text_content` | `assert.text` | `assertTextAction` |
+
+`form.select`(네이티브 select, `selectOptionAction`)와 `form.select_dropdown`(커스텀 드롭다운, `selectDropdownAction`)은
+서로 다른 구현체입니다. 별칭이 아닙니다.
 
 ### 3.3 액션 구현 확장 방법
 
@@ -241,7 +275,7 @@ detachFromTab(tabId): refCount-- (0이 될 때만 실제 detach)
 ### 6.2 변환 파이프라인
 
 1. 토큰 칩 파싱 -> 구조화된 입력
-2. **현재 검사 중 탭**의 DOM 요약 첨부 (선택적, 변환 시점 1페이지만)
+2. **현재 활성 탭**의 DOM 요약 첨부 (선택적, 변환 시점 1페이지만)
 3. LLM 호출 (SYSTEM_PROMPT + 사용자 입력 + DOM 컨텍스트)
 4. JSON DSL 응답 파싱
 5. `baseUrl` 후처리 (example.com -> 실제 호스트)
@@ -253,7 +287,7 @@ detachFromTab(tabId): refCount-- (0이 될 때만 실제 detach)
 
 ### 7.1 수집 방식
 
-- **DRR → DSL 변환:** 변환 버튼을 누를 때, 검사 중인 탭에서 **그 시점 한 페이지**의 DOM 요약만 수집해 LLM에 전달합니다. (도메인별 다중 페이지 캐시는 사용하지 않음.)
+- **DRR → DSL 변환:** 변환 버튼을 누를 때, 대상 탭에서 **그 시점 한 페이지**의 DOM 요약만 수집해 LLM에 전달합니다. (도메인별 다중 페이지 캐시는 사용하지 않음.)
 - **시나리오 실행:** 각 스텝 실행 시 CDP로 실시간 DOM을 캡처해 요소 매칭에 사용합니다.
 
 ### 7.2 수집 내용
@@ -288,14 +322,17 @@ detachFromTab(tabId): refCount-- (0이 될 때만 실제 detach)
 - 실행 중 스텝 자동 스크롤 (화면 중앙 포커싱)
 - 속도 프리셋 선택 (느리게/보통/빠르게)
 - 일시정지 / 이어서 실행 / 취소 / 다시 실행
-- 화면 녹화 (검사 탭 캡처, 자동 다운로드)
+- 화면 녹화 (대상 탭 캡처, 자동 다운로드)
 - 제목 인라인 편집
 - 검증 전용 모드
 
-### 8.3 설정
+### 8.3 설정 (SettingsModal)
 
-- OpenAI API 키 설정
-- 스텝 딜레이 프리셋
+- LLM provider 선택: 로컬 LLM / GPT-4o / Claude (provider별로 API 키를 따로 저장)
+- 로컬 LLM: Base URL, 모델 ID (OpenAI 호환 `/v1/chat/completions`)
+- Anthropic: 사내 게이트웨이 Base URL (선택)
+- LLM 매처(AI fallback) 사용 여부 — 끄면 코드 기반 매칭만 사용
+- 스텝 딜레이 프리셋 (느리게/보통/빠르게)
 
 ---
 
@@ -309,12 +346,22 @@ pnpm build
 
 `vite build` 후 `manifest.json`을 `dist/`에 복사합니다.
 
+### 테스트
+
+```bash
+pnpm test         # 1회 실행
+pnpm test:watch   # 감시 모드
+```
+
+vitest(node 환경)로 브라우저/CDP가 필요 없는 순수 로직만 테스트합니다. 설정은 `vitest.config.ts`, 테스트 파일은 대상 옆의 `*.test.ts`입니다. 현재 대상: `textMatch`, `urlMatch`, `scenarioHost`, `scenarioChain`, `flowLinearPath`, `settingsStore`(Service Worker 설정 전달).
+`background.ts`의 `buildScenarioFromRecorded`와 `llm.ts`의 토큰 파서는 export되지 않고(또는 모듈 로드 시 `chrome` API를 호출해) 아직 테스트 대상이 아닙니다. 모듈로 분리하면 테스트할 수 있습니다.
+
 ### Chrome 설치
 
 1. `chrome://extensions` 접속
 2. "개발자 모드" 활성화
 3. "압축해제된 확장 프로그램을 로드합니다" -> `dist/` 폴더 선택
-4. 개발자 도구(F12) -> "aflow" 탭에서 사용
+4. 툴바의 aflow 아이콘을 클릭하면 Side Panel이 열립니다. 대상 페이지 탭을 활성화한 상태에서 사용
 
 ### manifest.json 권한
 
@@ -323,9 +370,12 @@ pnpm build
 | `debugger` | CDP 통신 (시나리오 실행, 녹화) |
 | `activeTab` | 현재 탭 접근 |
 | `storage` | 확장 프로그램 저장소 |
-| `devtools` | DevTools 패널 등록 |
+| `sidePanel` | Side Panel UI 표시 |
 | `tabs` | 탭 URL 조회, 새 탭 감지 |
 | `tabCapture` | 화면 녹화 |
+
+`host_permissions`에는 LLM 호출 대상(OpenAI, Anthropic, 사내 LLM 게이트웨이/서버)이 들어 있습니다.
+다른 LLM 엔드포인트를 쓰려면 `manifest.json`의 `host_permissions`에 추가한 뒤 다시 빌드해야 합니다.
 
 ---
 

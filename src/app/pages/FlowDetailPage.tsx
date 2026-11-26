@@ -40,7 +40,7 @@ import {
   type SerializedFlow,
 } from "@/stores/flowCompositionStore";
 import { extractLinearScenarioOrderedIds } from "@/lib/flowLinearPath";
-import { getStepDelayMs, getApiKey, getLlmProvider } from "@/stores/settingsStore";
+import { getStepDelayMs, getApiKey, getLlmProvider, readLlmRuntimeConfig } from "@/stores/settingsStore";
 import { getActiveTabId } from "@/hooks/useActiveTabId";
 import { useInspectedTabUrl } from "@/hooks/useInspectedTabUrl";
 import { isActionImplemented } from "@/actions";
@@ -240,6 +240,7 @@ function FlowDetailInner({
         validationOnly: false,
         apiKey: getApiKey(),
         llmProvider: getLlmProvider(),
+        llmConfig: readLlmRuntimeConfig(),
       });
     } catch (err: unknown) {
       const message =

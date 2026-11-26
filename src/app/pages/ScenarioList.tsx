@@ -41,7 +41,7 @@ import {
   getInspectedPageSummary,
   formatPageSummaryForLLM,
 } from "@/services/domSnapshot";
-import { getApiKey, getLlmProvider } from "@/stores/settingsStore";
+import { getApiKey, getLlmProvider, readLlmRuntimeConfig } from "@/stores/settingsStore";
 import { getActiveTabId } from "@/hooks/useActiveTabId";
 import { buildScenarioRunChain } from "@/lib/scenarioChain";
 import {
@@ -196,6 +196,8 @@ export default function ScenarioList() {
         stepDelayMs: 800,
         validationOnly: true,
         apiKey: getApiKey(),
+        llmProvider: getLlmProvider(),
+        llmConfig: readLlmRuntimeConfig(),
       });
     } catch (e) {
       pendingValidationIdRef.current = null;
@@ -662,12 +664,15 @@ export default function ScenarioList() {
         <div className="flex flex-col min-h-0 flex-1 w-full max-w-full h-full pb-safe px-0">
           <div className="bg-white/95 backdrop-blur-md border-b border-[var(--flux-border-light)] px-3 py-2.5 flex items-center gap-2 text-xs text-[var(--flux-text-muted)] shrink-0 z-30 transition-all mb-1 shadow-sm min-w-0">
             <Globe className="w-3.5 h-3.5 text-[var(--flux-primary)] shrink-0" />
-            <Select value={effectiveDomain} onValueChange={handleSelectDomain}>
+            <Select
+              value={normalizeScenarioHost(effectiveDomain)}
+              onValueChange={handleSelectDomain}
+            >
               <SelectTrigger
                 className="h-auto min-w-0 flex-1 border-0 bg-transparent p-0 shadow-none text-[var(--flux-text-default)] font-mono text-xs font-medium focus:ring-0"
                 title="로컬에 저장된 사이트로 이동"
               >
-                <SelectValue className="truncate" />
+                <SelectValue className="truncate" placeholder={effectiveDomain || "도메인 선택"} />
               </SelectTrigger>
               <SelectContent>
                 {availableDomains.map((host) => (

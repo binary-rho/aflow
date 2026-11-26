@@ -27,6 +27,7 @@ import {
   getStepDelayMs,
   getApiKey,
   getLlmProvider,
+  readLlmRuntimeConfig,
   STEP_DELAY_PRESETS,
   type StepDelayPreset,
 } from "@/stores/settingsStore";
@@ -477,6 +478,7 @@ export default function ScenarioRunner() {
           validationOnly,
           apiKey: getApiKey(),
           llmProvider: getLlmProvider(),
+          llmConfig: readLlmRuntimeConfig(),
           startFromIndex,
         });
       } catch (err) {

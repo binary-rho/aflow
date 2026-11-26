@@ -443,21 +443,22 @@ export const WAIT_PROFILES: Record<"fast" | "normal" | "slow", WaitProfile> = {
 export async function waitForNetworkIdle(
   tabId: number,
   idleMs: number = 450,
-): Promise<void> {
-  if (!inFlightRequests.has(tabId)) return;
+): Promise<boolean> {
+  if (!inFlightRequests.has(tabId)) return false;
   // 처음부터 in-flight가 0이면(네트워크 안 타는 액션) 바로 반환 — 헛되이 idleMs 안 기다림.
-  if (getInFlightCount(tabId, Date.now()) === 0) return;
+  if (getInFlightCount(tabId, Date.now()) === 0) return false;
   const deadline = Date.now() + NETWORK_IDLE_MAX_WAIT_MS;
   let idleSince: number | null = null;
   while (Date.now() < deadline) {
     if (getInFlightCount(tabId, Date.now()) === 0) {
       if (idleSince == null) idleSince = Date.now();
-      if (Date.now() - idleSince >= idleMs) return;
+      if (Date.now() - idleSince >= idleMs) return true;
     } else {
       idleSince = null;
     }
     await sleep(NETWORK_IDLE_POLL_MS);
   }
+  return true;
 }
 
 /**
@@ -538,9 +539,12 @@ export async function waitForSettled(
   });
   // 2) 네트워크가 떴으면 잦아들 때까지(안 떴으면 즉시 반환)
   if (!profile.skipNetworkIdle) {
-    await waitForNetworkIdle(tabId, profile.networkIdleMs);
-    // 네트워크 응답으로 새 렌더가 생겼을 수 있으니 마지막으로 짧게 안정 확인
-    await waitForPageReady(tabId, { quietMs: profile.domQuietMs, changeStartMs: 0 });
+    const waitedForNetwork = await waitForNetworkIdle(tabId, profile.networkIdleMs);
+    // 네트워크 응답으로 새 렌더가 생겼을 수 있으니 마지막으로 짧게 안정 확인.
+    // 요청이 없었으면(1단계에서 이미 안정 확인함) 같은 quiet 대기를 또 하지 않는다.
+    if (waitedForNetwork) {
+      await waitForPageReady(tabId, { quietMs: profile.domQuietMs, changeStartMs: 0 });
+    }
   }
 }
 
@@ -573,7 +577,9 @@ function buildHighlightAndActScript(doClick: boolean): string {
         setTimeout(function() {
           if (shouldClick) el.click();
           ov.style.opacity = '0';
-          setTimeout(function() { ov.remove(); resolve(); }, 300);
+          // 페이드아웃은 백그라운드로 두고 바로 반환 — 오버레이 제거를 기다리며 스텝당 300ms 낭비하지 않는다.
+          setTimeout(function() { ov.remove(); }, 300);
+          resolve();
         }, ${HIGHLIGHT_DELAY_MS});
       });
     }
